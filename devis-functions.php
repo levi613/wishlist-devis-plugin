@@ -302,11 +302,62 @@ function wishlist_devis_generate_word($products, $data)
     $totalHT = 0;
     $rowCount = 0;
 
-    // $all_references = []; // Tableau pour stocker toutes les références uniques
+    $all_references = []; // Tableau pour stocker toutes les références uniques
+    $all_references_quantities = []; // Tableau pour stocker les quantités cumulées par référence
+    $all_references_images = []; // Tableau pour stocker les images associées à chaque référence
+    $all_references_is_single = []; // Pour suivre si une référence apparaît seule dans un produit
 
+    // Première passe: identifier les références qui apparaissent seules dans un produit
+    foreach ($products as $product) {
+        $product_name = trim($product['name']);
+        $product_image = isset($product['img']) ? $product['img'] : 'N/A';
+
+        // Vérifier si ce produit contient une seule référence
+        $temp_references = [];
+
+        if (strpos($product_name, '&') !== false) {
+            $temp_references = array_map('trim', explode('&', $product_name));
+        } else {
+            $pattern = '/([A-Za-z]{1,2}(?:\s+\d+){2,4})/';
+            if (preg_match_all($pattern, $product_name, $matches)) {
+                $temp_references = $matches[0];
+            } else {
+                $temp_references = [$product_name];
+            }
+        }
+
+        // Si une seule référence est trouvée dans ce produit
+        if (count($temp_references) === 1) {
+            $ref = trim($temp_references[0]);
+
+            // Standardiser la référence
+            if (!empty($ref) && strlen($ref) > 0) {
+                if (preg_match('/^([A-Za-z]{1,2})/', $ref, $matches)) {
+                    $prefix = $matches[1];
+                    $standardized_ref = strtoupper($prefix) . substr($ref, strlen($prefix));
+                } else {
+                    $standardized_ref = $ref;
+                }
+            } else {
+                $standardized_ref = $ref;
+            }
+
+            // Extraire les composants et créer la clé standard
+            $ref_components = preg_split('/\s+/', $standardized_ref);
+            $standard_key = implode('_', $ref_components);
+
+            // Marquer cette référence comme apparaissant seule et sauvegarder son image
+            $all_references_is_single[$standard_key] = true;
+            $all_references_images[$standard_key] = $product_image;
+        }
+    }
+
+    // Deuxième passe: traiter toutes les références et gérer les doublons
     foreach ($products as $product) {
         // Récupérer la quantité (avec 1 comme valeur par défaut)
         $quantity = isset($product['quantity']) ? intval($product['quantity']) : 1;
+        $product_name = trim($product['name']);
+        $product_image = isset($product['img']) ? $product['img'] : 'N/A';
 
         // Vérifier s'il s'agit de références multiples (séparées par ou non par "&")
         // et les diviser en conséquence
@@ -336,26 +387,45 @@ function wishlist_devis_generate_word($products, $data)
             $ref = trim($ref);
 
             // Standardiser la référence pour comparaison
-            // 1. Convertir la première lettre en majuscule
+            // 1. Convertir la ou les première(s) lettre(s) en majuscule
             if (!empty($ref) && strlen($ref) > 0) {
-                $standardized_ref = strtoupper(substr($ref, 0, 1)) . substr($ref, 1);
+                // Détection si le préfixe est de 1 ou 2 lettres
+                if (preg_match('/^([A-Za-z]{1,2})/', $ref, $matches)) {
+                    $prefix = $matches[1];
+                    $standardized_ref = strtoupper($prefix) . substr($ref, strlen($prefix));
+                } else {
+                    $standardized_ref = $ref;
+                }
             } else {
                 $standardized_ref = $ref;
             }
 
             // 2. Extraire les composants de la référence pour une comparaison structurée
             $ref_components = preg_split('/\s+/', $standardized_ref);
-            $letter = isset($ref_components[0]) ? $ref_components[0] : '';
 
             // Reconstruire la référence standardisée avec les composants
             $standard_key = implode('_', $ref_components);
 
-            // **NOUVELLE VÉRIFICATION** pour voir si la référence est déjà traitée
-            // if (isset($all_references[$standard_key])) {
-            //     continue; // On ignore la référence car elle a déjà été ajoutée
-            // }
+            // On cumule les quantités si la référence existe déjà globalement
+            if (isset($all_references[$standard_key])) {
+                // On ajoute la quantité actuelle à la quantité déjà enregistrée
+                $all_references_quantities[$standard_key] += $quantity;
+                // Ne pas modifier l'image si cette référence apparaît seule dans un autre produit
+                // L'image a déjà été définie dans la première passe si applicable
+            } else {
+                // Nouvelle référence, l'ajouter à notre tableau global avec sa quantité
+                $all_references[$standard_key] = $standardized_ref;
+                $all_references_quantities[$standard_key] = $quantity;
 
-            // $all_references[$standard_key] = true; // Ajouter au tableau global
+                // Si cette référence n'a pas déjà une image associée (depuis la première passe)
+                if (!isset($all_references_images[$standard_key])) {
+                    $all_references_images[$standard_key] = $product_image;
+                }
+
+                // Et aussi l'ajouter au tableau local pour traitement dans cette itération
+                $unique_references[$standard_key] = $standardized_ref;
+                $reference_quantities[$standard_key] = $quantity;
+            }
 
             // Vérifier si cette référence existe déjà
             if (isset($reference_quantities[$standard_key])) {
@@ -367,89 +437,96 @@ function wishlist_devis_generate_word($products, $data)
                 $reference_quantities[$standard_key] = $quantity;
             }
         }
+    }
 
-        foreach ($unique_references as $key => $ref) {
-            // Récupérer la quantité pour cette référence
-            $ref_quantity = $reference_quantities[$key];
+    // Après avoir traité tous les produits, on génère le tableau avec les références uniques
+    $rowCount = 0;
+    $totalHT = 0;
+    foreach ($all_references as $key => $ref) {
+        // Récupérer les informations associées à cette référence
+        $ref_quantity = $all_references_quantities[$key];
+        $ref_image = $all_references_images[$key];
 
-            // Extraire les composants pour traitement
-            $ref_components = preg_split('/\s+/', $ref);
-            $letter = isset($ref_components[0]) ? strtoupper($ref_components[0]) : '';
+        // Extraire les composants pour traitement
+        $ref_components = preg_split('/\s+/', $ref);
 
-            // Initialiser les numéros avec des valeurs par défaut
-            $num1 = isset($ref_components[1]) ? $ref_components[1] : '';
-            $num2 = isset($ref_components[2]) ? $ref_components[2] : '';
-            $num3 = isset($ref_components[3]) ? $ref_components[3] : '';
+        // Déterminer si le préfixe est 1 ou 2 lettres
+        if (preg_match('/^([A-Za-z]{1,2})/', $ref_components[0], $matches)) {
+            $letter = strtoupper($matches[1]);
+        } else {
+            $letter = strtoupper(substr($ref_components[0], 0, 1));
+        }
 
-            // Rechercher les infos dans les données Excel
-            $price = '';
-            $designation = '';
+        // Initialiser les numéros avec des valeurs par défaut
+        $num1 = isset($ref_components[1]) ? $ref_components[1] : '';
+        $num2 = isset($ref_components[2]) ? $ref_components[2] : '';
+        $num3 = isset($ref_components[3]) ? $ref_components[3] : '';
 
-            foreach ($excelData as $row) {
-                // Essayer de faire correspondre les composants disponibles
-                if (
-                    $row['letter'] == $letter &&
-                    (empty($num1) || $row['num1'] == $num1) &&
-                    (empty($num2) || $row['num2'] == $num2) &&
-                    (empty($num3) || $row['num3'] == $num3)
-                ) {
+        // Rechercher les infos dans les données Excel
+        $price = '';
+        $designation = '';
 
-                    $price = $row['price'];
-                    $designation = $row['designation'];
-                    break;
-                }
+        foreach ($excelData as $row) {
+            // Essayer de faire correspondre les composants disponibles
+            if (
+                $row['letter'] == $letter &&
+                (empty($num1) || $row['num1'] == $num1) &&
+                (empty($num2) || $row['num2'] == $num2) &&
+                (empty($num3) || $row['num3'] == $num3)
+            ) {
+
+                $price = $row['price'];
+                $designation = $row['designation'];
+                break;
             }
+        }
 
-            // Alterner les couleurs de ligne pour une meilleure lisibilité
-            $rowCount++;
-            $cellRowStyle = $cellStyle;
-            if ($rowCount % 2 == 0) {
-                $cellRowStyle = array_merge($cellStyle, ['bgColor' => 'F2F2F2']);
-            }
+        // Alterner les couleurs de ligne pour une meilleure lisibilité
+        $rowCount++;
+        $cellRowStyle = $cellStyle;
+        if ($rowCount % 2 == 0) {
+            $cellRowStyle = array_merge($cellStyle, ['bgColor' => 'F2F2F2']);
+        }
 
-            // Vérifier si le prix est valide
-            $price = str_replace(',', '.', $price); // Remplacer la virgule par un point pour la conversion
-            $price = floatval($price);
-            // Vérifier si le prix est valide
-            if ($price === 0) {
-                $price = 0; // Si le prix est invalide, le mettre à 0
-            }
+        // Vérifier si le prix est valide
+        $price = str_replace(',', '.', $price); // Remplacer la virgule par un point pour la conversion
+        $price = floatval($price);
+        // Vérifier si le prix est valide
+        if ($price === 0) {
+            $price = 0; // Si le prix est invalide, le mettre à 0
+        }
 
-            // Vérifier si la quantité est valide
-            $ref_quantity = max(1, $reference_quantities[$standard_key]);
+        // Ajouter la ligne produit
+        $table->addRow();
+        $table->addCell(2000, $cellRowStyle)->addText($ref, $fontStyle);
+        $table->addCell(2800, $cellRowStyle)->addText($designation, $fontStyle);
+        $table->addCell(1100, $cellRowStyle)->addText($ref_quantity, $fontStyle);
+        $table->addCell(1000, $cellRowStyle)->addText($price . ' €', $fontStyle);
 
-            // Ajouter la ligne produit
-            $table->addRow();
-            $table->addCell(2000, $cellRowStyle)->addText($ref, $fontStyle);
-            $table->addCell(2800, $cellRowStyle)->addText($designation, $fontStyle);
-            $table->addCell(1100, $cellRowStyle)->addText($ref_quantity, $fontStyle);
-            $table->addCell(1000, $cellRowStyle)->addText($price . ' €', $fontStyle);
+        // Calculer et ajouter le total par ligne
+        $lineTotal = $price * $ref_quantity;
+        $table->addCell(1200, $cellRowStyle)->addText(number_format($lineTotal, 2, ',', ' ') . ' €', $fontStyle);
 
-            // Calculer et ajouter le total par ligne
-            $lineTotal = $price * $ref_quantity;
-            $table->addCell(1200, $cellRowStyle)->addText(number_format($lineTotal, 2, ',', ' ') . ' €', $fontStyle);
-
-            // Ajouter l'image si disponible
-            $cell = $table->addCell(1800, $cellRowStyle);
-            if (!empty($product['img']) && $product['img'] !== 'N/A') {
-                // Convertir l'URL de l'image en chemin local si nécessaire
-                $img_path = convert_url_to_path($product['img']);
-                if ($img_path) {
-                    try {
-                        $cell->addImage($img_path, ['width' => 80]);
-                    } catch (Exception $e) {
-                        $cell->addText('Image non disponible', $fontStyle);
-                    }
-                } else {
+        // Ajouter l'image si disponible
+        $cell = $table->addCell(1800, $cellRowStyle);
+        if (!empty($ref_image) && $ref_image !== 'N/A') {
+            // Convertir l'URL de l'image en chemin local si nécessaire
+            $img_path = convert_url_to_path($ref_image);
+            if ($img_path) {
+                try {
+                    $cell->addImage($img_path, ['width' => 80]);
+                } catch (Exception $e) {
                     $cell->addText('Image non disponible', $fontStyle);
                 }
             } else {
                 $cell->addText('Image non disponible', $fontStyle);
             }
-
-            // Ajouter au total HT
-            $totalHT += (float)$price * $ref_quantity;
+        } else {
+            $cell->addText('Image non disponible', $fontStyle);
         }
+
+        // Ajouter au total HT
+        $totalHT += (float)$price * $ref_quantity;
     }
 
     // Ajouter le total dans un tableau dédié pour une meilleure présentation

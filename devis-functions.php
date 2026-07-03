@@ -182,7 +182,7 @@ function wishlist_devis_get_or_create_reference($email)
             $wpdb->query('ROLLBACK');
             error_log(
                 'wishlist_devis_get_or_create_reference: espace de référence épuisé '
-                . '(limite 9999) pour l\'email ' . $email
+                    . '(limite 9999) pour l\'email ' . $email
             );
             return '';
         }
@@ -211,7 +211,7 @@ function wishlist_devis_get_or_create_reference($email)
 
     error_log(
         'wishlist_devis_get_or_create_reference: allocation impossible après '
-        . WD_REFERENCE_MAX_ATTEMPTS . ' tentatives pour l\'email ' . $email
+            . WD_REFERENCE_MAX_ATTEMPTS . ' tentatives pour l\'email ' . $email
     );
     return '';
 }
@@ -596,7 +596,7 @@ function wishlist_devis_send_email()
                 <h3>Informations client :</h3>
                 <p><strong>Référence :</strong> ' . esc_html($reference) . '</p>
                 <p><strong>Type de client :</strong> ' . esc_html($customer_type_label) . '</p>'
-                . ($is_professional ? '
+        . ($is_professional ? '
                 <p><strong>Société :</strong> ' . esc_html($data['company_name']) . '</p>
                 <p><strong>SIRET :</strong> ' . esc_html($data['siret']) . '</p>' : '') . '
                 <p><strong>Nom :</strong> ' . esc_html($data['full_name']) . '</p>
@@ -630,7 +630,7 @@ function wishlist_devis_send_email()
     $html_message .= '
             </table>
             
-            <p>Le devis Au format Word est joint à cet email.</p>
+            <p>Le devis au format Excel est joint à cet email.</p>
             
             <p>Cordialement,<br>Le système automatique de devis</p>
         </div>
@@ -665,11 +665,12 @@ function wishlist_devis_send_email()
         $text_message .= "- " . $product['name'] . " (Quantité: " . $quantity . ")\n";
     }
 
-    $text_message .= "\nLe devis est joint à cet email.\n";
+    $text_message .= "\nLe devis au format Excel est joint à cet email.\n";
     $text_message .= "Cordialement,\nLe système automatique de devis";
 
-    // Génération du devis en Word (.docx)
-    $file_path = wishlist_devis_generate_word($data['products'], $data);
+    // Génération du devis en Excel (.xlsx)
+    $data['created_at'] = current_time('mysql');
+    $file_path = wishlist_devis_generate_excel($data['products'], $data, $rowId);
 
     // Envoi de l'email avec pièce jointe
     $headers = [
@@ -1156,6 +1157,339 @@ function wishlist_devis_generate_word($products, $data)
     return $file_path;
 }
 
+/**
+ * Génère le devis au format Excel (.xlsx) à partir du modèle modele-devis.xlsx.
+ *
+ * Structure du modèle :
+ *   I1  : Référence client (4 chiffres)
+ *   E1  : Nom de société (professionnels uniquement)
+ *   E3-E9 : Infos client (nom, adresse, CP+ville, pays, téléphone, email, SIRET)
+ *   C10 : Numéro de devis (ex : 2026 05 0001) — compteur mensuel remis à zéro
+ *   C11 : Date en français long (ex : 26 mai 2026)
+ *   À partir de la ligne 14 : produits (A=JB AdeV, B=ref, C=désig, D=coll,
+ *                              E=finition, F=dim, G=qté, H=prix unit, I=total, J=image)
+ *   2 lignes sous le dernier produit, colonne I : formule =SUM(I14:I{last})
+ *
+ * @param array  $products  Tableau de produits (issu de la BDD ou du formulaire).
+ * @param array  $data      Données client assainies.
+ * @param int    $devis_id  Id BDD du devis (pour le numéro séquentiel mensuel).
+ * @return string Chemin absolu du fichier généré, ou '' en cas d'échec.
+ */
+function wishlist_devis_generate_excel($products, $data, $devis_id = 0)
+{
+    if (!class_exists('PhpOffice\PhpSpreadsheet\IOFactory')) {
+        require_once plugin_dir_path(__FILE__) . 'vendor/autoload.php';
+    }
+
+    date_default_timezone_set('Europe/Paris');
+
+    // Charger le modèle
+    $template_path = plugin_dir_path(__FILE__) . 'modele-devis.xlsx';
+    if (!file_exists($template_path)) {
+        error_log('wishlist_devis_generate_excel: modele-devis.xlsx introuvable.');
+        return '';
+    }
+
+    try {
+        $spreadsheet = \PhpOffice\PhpSpreadsheet\IOFactory::load($template_path);
+    } catch (Exception $e) {
+        error_log('wishlist_devis_generate_excel: impossible de charger le modèle — ' . $e->getMessage());
+        return '';
+    }
+
+    $sheet = $spreadsheet->getActiveSheet();
+
+    // ---- Infos client ----
+    $reference       = isset($data['reference']) ? $data['reference'] : '';
+    $is_professional = (isset($data['customer_type']) && $data['customer_type'] === WD_CUSTOMER_TYPE_PROFESSIONAL);
+    $company_name    = $is_professional ? (isset($data['company_name']) ? $data['company_name'] : '') : '';
+    $full_name       = isset($data['full_name']) ? $data['full_name'] : (isset($data['name']) ? $data['name'] : '');
+    $created_at_str  = isset($data['created_at']) ? $data['created_at'] : current_time('mysql');
+
+    $sheet->setCellValue('I1', $reference);
+    $sheet->setCellValue('E1', $company_name);
+    $sheet->setCellValue('E3', $full_name);
+    $sheet->setCellValue('E4', isset($data['address']) ? $data['address'] : '');
+    $postal_city = trim(
+        (isset($data['postal_code']) ? $data['postal_code'] : '') . ' ' .
+            (isset($data['city']) ? $data['city'] : '')
+    );
+    $sheet->setCellValue('E5', $postal_city);
+    $sheet->setCellValue('E6', isset($data['country']) ? $data['country'] : '');
+    $sheet->setCellValue('E7', isset($data['phone']) ? $data['phone'] : '');
+    $sheet->setCellValue('E8', isset($data['email']) ? $data['email'] : '');
+    if ($is_professional && !empty($data['siret'])) {
+        $sheet->setCellValue('E9', 'SIRET : ' . $data['siret']);
+    }
+
+    // ---- Numéro de devis (C10) : AAAA MM NNNN — compteur mensuel ----
+    global $wpdb;
+    $requests_table = $wpdb->prefix . 'wishlist_devis_requests';
+    $date_ts        = strtotime($created_at_str);
+    $year_month     = date('Y-m', $date_ts);
+
+    if ($devis_id > 0) {
+        $monthly_seq = (int) $wpdb->get_var($wpdb->prepare(
+            "SELECT COUNT(*) FROM {$requests_table}
+             WHERE DATE_FORMAT(created_at, '%%Y-%%m') = %s AND id <= %d",
+            $year_month,
+            $devis_id
+        ));
+        if ($monthly_seq < 1) {
+            $monthly_seq = 1;
+        }
+    } else {
+        $monthly_seq = 1;
+    }
+
+    $devis_num = date('Y', $date_ts) . ' ' . date('m', $date_ts) . ' ' . str_pad($monthly_seq, 4, '0', STR_PAD_LEFT);
+    $sheet->setCellValue('C10', $devis_num);
+
+    // ---- Date longue en français (C11) ----
+    if (class_exists('IntlDateFormatter')) {
+        $fmt      = new IntlDateFormatter('fr_FR', IntlDateFormatter::LONG, IntlDateFormatter::NONE);
+        $date_str = $fmt->format($date_ts);
+    } else {
+        $months_fr = [
+            '',
+            'janvier',
+            'février',
+            'mars',
+            'avril',
+            'mai',
+            'juin',
+            'juillet',
+            'août',
+            'septembre',
+            'octobre',
+            'novembre',
+            'décembre'
+        ];
+        $date_str  = (int) date('d', $date_ts) . ' ' . $months_fr[(int) date('n', $date_ts)] . ' ' . date('Y', $date_ts);
+    }
+    $sheet->setCellValue('C11', $date_str);
+
+    // ---- Lecture du catalogue produits ----
+    $excelData = get_excel_data();
+
+    // ---- Traitement des références (même logique que le générateur Word) ----
+    $all_references            = [];
+    $all_references_quantities = [];
+    $all_references_images     = [];
+
+    // Première passe : détecter les images des références isolées
+    foreach ($products as $product) {
+        $product_name  = trim($product['name']);
+        $product_image = isset($product['img']) ? $product['img'] : 'N/A';
+        $temp_refs     = [];
+
+        if (strpos($product_name, '&') !== false) {
+            $temp_refs = array_map('trim', explode('&', $product_name));
+        } else {
+            $pattern = '/([A-Za-z]{1,2}(?:\s+\d+){2,4})/';
+            if (preg_match_all($pattern, $product_name, $matches)) {
+                $temp_refs = $matches[0];
+            } else {
+                $temp_refs = [$product_name];
+            }
+        }
+
+        if (count($temp_refs) === 1) {
+            $ref = trim($temp_refs[0]);
+            if (preg_match('/^([A-Za-z]{1,2})/', $ref, $m)) {
+                $std_ref = strtoupper($m[1]) . substr($ref, strlen($m[1]));
+            } else {
+                $std_ref = $ref;
+            }
+            $std_key                         = implode('_', preg_split('/\s+/', $std_ref));
+            $all_references_images[$std_key] = $product_image;
+        }
+    }
+
+    // Deuxième passe : agréger les quantités
+    foreach ($products as $product) {
+        $quantity      = isset($product['quantity']) ? intval($product['quantity']) : 1;
+        $product_name  = trim($product['name']);
+        $product_image = isset($product['img']) ? $product['img'] : 'N/A';
+        $temp_refs     = [];
+
+        if (strpos($product_name, '&') !== false) {
+            $temp_refs = array_map('trim', explode('&', $product_name));
+        } else {
+            $pattern = '/([A-Za-z](?:\s+\d+){2,4})/';
+            if (preg_match_all($pattern, $product_name, $matches)) {
+                $temp_refs = $matches[0];
+            } else {
+                $temp_refs = [$product_name];
+            }
+        }
+
+        foreach ($temp_refs as $ref) {
+            $ref = trim($ref);
+            if (preg_match('/^([A-Za-z]{1,2})/', $ref, $m)) {
+                $std_ref = strtoupper($m[1]) . substr($ref, strlen($m[1]));
+            } else {
+                $std_ref = $ref;
+            }
+            $std_key = implode('_', preg_split('/\s+/', $std_ref));
+
+            if (isset($all_references[$std_key])) {
+                $all_references_quantities[$std_key] += $quantity;
+            } else {
+                $all_references[$std_key]            = $std_ref;
+                $all_references_quantities[$std_key] = $quantity;
+                if (!isset($all_references_images[$std_key])) {
+                    $all_references_images[$std_key] = $product_image;
+                }
+            }
+        }
+    }
+
+    // ---- Construire la liste finale des lignes produits ----
+    $product_rows = [];
+    foreach ($all_references as $key => $ref) {
+        $ref_components = preg_split('/\s+/', $ref);
+        if (preg_match('/^([A-Za-z]{1,2})/', $ref_components[0], $m)) {
+            $letter = strtoupper($m[1]);
+        } else {
+            $letter = strtoupper(substr($ref_components[0], 0, 1));
+        }
+        $num1 = isset($ref_components[1]) ? $ref_components[1] : '';
+        $num2 = isset($ref_components[2]) ? $ref_components[2] : '';
+        $num3 = isset($ref_components[3]) ? $ref_components[3] : '';
+
+        $price       = '';
+        $designation = '';
+        $collection  = '';
+        $finition    = '';
+        $dimension   = '';
+
+        foreach ($excelData as $catalog_row) {
+            if (
+                $catalog_row['letter'] == $letter &&
+                (empty($num1) || $catalog_row['num1'] == $num1) &&
+                (empty($num2) || $catalog_row['num2'] == $num2) &&
+                (empty($num3) || $catalog_row['num3'] == $num3)
+            ) {
+                $price       = $catalog_row['price'];
+                $designation = $catalog_row['designation'];
+                $collection  = $catalog_row['collection'];
+                $finition    = $catalog_row['finition'];
+                $dimension   = $catalog_row['dimension'];
+                break;
+            }
+        }
+
+        $product_rows[] = [
+            'ref'         => $ref,
+            'designation' => $designation,
+            'collection'  => $collection,
+            'finition'    => $finition,
+            'dimension'   => $dimension,
+            'quantity'    => $all_references_quantities[$key],
+            'unit_price'  => floatval(str_replace(',', '.', $price)),
+            'image_url'   => isset($all_references_images[$key]) ? $all_references_images[$key] : 'N/A',
+        ];
+    }
+
+    if (empty($product_rows)) {
+        $product_rows[] = [
+            'ref' => '',
+            'designation' => '',
+            'collection' => '',
+            'finition' => '',
+            'dimension' => '',
+            'quantity' => 1,
+            'unit_price' => 0,
+            'image_url' => 'N/A',
+        ];
+    }
+
+    $num_products = count($product_rows);
+
+    // ---- Lire le format monétaire depuis la cellule I14 du modèle ----
+    $currency_format = $sheet->getStyle('I14')->getNumberFormat()->getFormatCode();
+    if (empty($currency_format) || $currency_format === 'General' || $currency_format === '@') {
+        $currency_format = '# ##0,00\ "€"';
+    }
+
+    // ---- Insérer les lignes supplémentaires avant la ligne 15 ----
+    if ($num_products > 1) {
+        $sheet->insertNewRowBefore(15, $num_products - 1);
+        for ($i = 0; $i < $num_products - 1; $i++) {
+            $new_row = 15 + $i;
+            $sheet->duplicateStyle($sheet->getStyle('A14:J14'), 'A' . $new_row . ':J' . $new_row);
+            $row_height = $sheet->getRowDimension(14)->getRowHeight();
+            if ($row_height > 0) {
+                $sheet->getRowDimension($new_row)->setRowHeight($row_height);
+            }
+        }
+    }
+
+    // ---- Remplir les lignes produits ----
+    foreach ($product_rows as $idx => $prod) {
+        $row_num = 14 + $idx;
+
+        $sheet->setCellValue('A' . $row_num, 'JB AdeV');
+        $sheet->setCellValue('B' . $row_num, $prod['ref']);
+        $sheet->setCellValue('C' . $row_num, $prod['designation']);
+        $sheet->setCellValue('D' . $row_num, $prod['collection']);
+        $sheet->setCellValue('E' . $row_num, $prod['finition']);
+        $sheet->setCellValue('F' . $row_num, $prod['dimension']);
+        $sheet->setCellValue('G' . $row_num, $prod['quantity']);
+
+        if ($prod['unit_price'] > 0) {
+            $sheet->setCellValue('H' . $row_num, $prod['unit_price']);
+            $sheet->getStyle('H' . $row_num)->getNumberFormat()->setFormatCode($currency_format);
+            $sheet->setCellValue('I' . $row_num, $prod['unit_price'] * $prod['quantity']);
+            $sheet->getStyle('I' . $row_num)->getNumberFormat()->setFormatCode($currency_format);
+        }
+
+        // Image du produit en colonne J
+        if (!empty($prod['image_url']) && $prod['image_url'] !== 'N/A') {
+            $img_path = convert_url_to_path($prod['image_url']);
+            if ($img_path && file_exists($img_path)) {
+                try {
+                    $drawing = new \PhpOffice\PhpSpreadsheet\Worksheet\Drawing();
+                    $drawing->setName('Produit');
+                    $drawing->setDescription($prod['ref']);
+                    $drawing->setPath($img_path);
+                    $drawing->setHeight(60);
+                    $drawing->setOffsetX(2);
+                    $drawing->setOffsetY(2);
+                    $drawing->setCoordinates('J' . $row_num);
+                    $drawing->setWorksheet($sheet);
+                    $sheet->getRowDimension($row_num)->setRowHeight(55);
+                } catch (Exception $e) {
+                    // Image indisponible — on continue sans elle
+                }
+            }
+        }
+    }
+
+    // ---- Total HT — formule 2 lignes sous le dernier produit, colonne I ----
+    $last_product_row = 13 + $num_products; // = 14 + ($num_products - 1)
+    $total_ht_row     = $last_product_row + 2;
+
+    $sheet->setCellValue('I' . $total_ht_row, '=SUM(I14:I' . $last_product_row . ')');
+    $sheet->getStyle('I' . $total_ht_row)->getNumberFormat()->setFormatCode($currency_format);
+
+    // ---- Sauvegarder le fichier ----
+    $upload_dir = wp_upload_dir();
+    $file_name  = 'Devis_JBAdeV_' . ($devis_id > 0 ? str_pad($devis_id, 6, '0', STR_PAD_LEFT) : date('Ymd_His')) . '.xlsx';
+    $file_path  = $upload_dir['path'] . '/' . $file_name;
+
+    try {
+        $writer = \PhpOffice\PhpSpreadsheet\IOFactory::createWriter($spreadsheet, 'Xlsx');
+        $writer->save($file_path);
+    } catch (Exception $e) {
+        error_log('wishlist_devis_generate_excel: impossible de sauvegarder — ' . $e->getMessage());
+        return '';
+    }
+
+    return $file_path;
+}
+
 // Fonction pour récupérer les données du fichier Excel
 function get_excel_data()
 {
@@ -1278,6 +1612,42 @@ function wishlist_devis_handle_admin_post()
 
     $admin_action = isset($_REQUEST['wd_action']) ? sanitize_key($_REQUEST['wd_action']) : '';
 
+    // --- Téléchargement Excel ---
+    if ($admin_action === 'download_excel') {
+        $id = isset($_GET['id']) ? (int) $_GET['id'] : 0;
+        if ($id > 0 && isset($_GET['_wpnonce']) && wp_verify_nonce(sanitize_text_field(wp_unslash($_GET['_wpnonce'])), 'wd_download_excel_' . $id)) {
+            $row = $wpdb->get_row($wpdb->prepare("SELECT * FROM {$requests_table} WHERE id = %d", $id), ARRAY_A);
+            if ($row) {
+                $products = array();
+                if (!empty($row['products'])) {
+                    $decoded = json_decode($row['products'], true);
+                    if (is_array($decoded)) {
+                        $products = $decoded;
+                    }
+                }
+                $data              = $row;
+                $data['name']      = $row['full_name'];
+                $data['products']  = $products;
+
+                $file_path = wishlist_devis_generate_excel($products, $data, $id);
+
+                if ($file_path && file_exists($file_path)) {
+                    $ref       = isset($row['reference']) ? $row['reference'] : $id;
+                    $file_name = 'Devis_JBAdeV_ref' . $ref . '_' . date('Ymd') . '.xlsx';
+                    header('Content-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+                    header('Content-Disposition: attachment; filename="' . $file_name . '"');
+                    header('Content-Length: ' . filesize($file_path));
+                    header('Cache-Control: max-age=0');
+                    readfile($file_path);
+                    @unlink($file_path);
+                    exit;
+                }
+            }
+        }
+        wp_redirect(admin_url('admin.php?page=wishlist-devis-requests'));
+        exit;
+    }
+
     // --- Suppression ---
     if ($admin_action === 'delete') {
         $id = isset($_GET['id']) ? (int) $_GET['id'] : 0;
@@ -1377,6 +1747,10 @@ function wishlist_devis_render_admin_page()
             admin_url('admin.php?page=wishlist-devis-requests&wd_action=delete&id=' . $edit_id),
             'wd_delete_' . $edit_id
         );
+        $download_excel_url = wp_nonce_url(
+            admin_url('admin.php?page=wishlist-devis-requests&wd_action=download_excel&id=' . $edit_id),
+            'wd_download_excel_' . $edit_id
+        );
 
         $products = array();
         if (!empty($row['products'])) {
@@ -1413,7 +1787,7 @@ function wishlist_devis_render_admin_page()
 
         if ($is_edit) {
             // -- Mode édition : champs modifiables
-            $field = function($label, $name, $value, $type = 'text') use ($row) {
+            $field = function ($label, $name, $value, $type = 'text') use ($row) {
                 echo '<div class="wd-field-row">';
                 echo '<label for="wd-' . esc_attr($name) . '">' . esc_html($label) . '</label>';
                 echo '<input type="' . esc_attr($type) . '" id="wd-' . esc_attr($name) . '" name="' . esc_attr($name) . '" value="' . esc_attr($value) . '">';
@@ -1510,6 +1884,7 @@ function wishlist_devis_render_admin_page()
         } else {
             echo '<button type="submit" class="button button-primary">Mettre à jour le statut</button> ';
             echo '<a href="' . esc_url($edit_url) . '" class="button">Modifier les informations</a> ';
+            echo '<a href="' . esc_url($download_excel_url) . '" class="button button-secondary">&#11015; Télécharger Excel</a> ';
             echo '<a href="' . esc_url($delete_url) . '" class="button button-link-delete wd-delete-link" onclick="return confirm(\'Supprimer définitivement cette demande ?\')">Supprimer</a>';
         }
         echo '</div>';
@@ -1574,7 +1949,11 @@ function wishlist_devis_render_admin_page()
         }
         $product_count = count($products);
 
-        $view_url   = admin_url('admin.php?page=wishlist-devis-requests&action=view&id=' . $id);
+        $view_url          = admin_url('admin.php?page=wishlist-devis-requests&action=view&id=' . $id);
+        $download_excel_url = wp_nonce_url(
+            admin_url('admin.php?page=wishlist-devis-requests&wd_action=download_excel&id=' . $id),
+            'wd_download_excel_' . $id
+        );
         $delete_url = wp_nonce_url(
             admin_url('admin.php?page=wishlist-devis-requests&wd_action=delete&id=' . $id),
             'wd_delete_' . $id
@@ -1591,6 +1970,7 @@ function wishlist_devis_render_admin_page()
         echo '<td><span class="' . $status_css . '">' . esc_html($status_label) . '</span></td>';
         echo '<td class="wd-row-actions">';
         echo '<a href="' . esc_url($view_url) . '" class="button button-small">Voir</a> ';
+        echo '<a href="' . esc_url($download_excel_url) . '" class="button button-small">⬇ Excel</a> ';
         echo '<a href="' . esc_url($delete_url) . '" class="button button-small button-link-delete" onclick="return confirm(\'Supprimer cette demande ?\')">Supprimer</a>';
         echo '</td>';
         echo '</tr>';

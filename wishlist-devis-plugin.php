@@ -60,23 +60,29 @@ function wishlist_devis_enqueue_styles()
     // dans le <head>, en dernier dans la cascade → écrase le thème même sans !important.
     // Les !important restants couvrent les thèmes qui utilisent eux-mêmes !important.
     wp_add_inline_style('wishlist-devis-style', '
+        /* --- Reset global : le thème ajoute souvent margin sur tous les div/p --- */
+        .wishlist-devis-form div,
+        .wishlist-devis-form p                                 { margin-top: 0 !important; }
+        .wishlist-devis-form .wd-form-subtitle                 { margin-bottom: 20px !important; }
+
         /* --- Reset espacement parasites du thème --- */
-        .wishlist-devis-container label                        { margin-top: 0 !important; margin-bottom: 4px !important; padding: 0 !important; line-height: 1.3 !important; font-size: 13px !important; font-weight: 600 !important; display: block !important; }
+        .wishlist-devis-container label                        { margin: 0 0 4px !important; padding: 0 !important; line-height: 1.3 !important; font-size: 13px !important; font-weight: 600 !important; display: block !important; float: none !important; width: auto !important; }
         .wishlist-devis-container input[type="text"],
         .wishlist-devis-container input[type="email"],
-        .wishlist-devis-container input[type="tel"]            { margin: 0 !important; padding: 10px 14px !important; width: 100% !important; border: 1px solid #d8dce0 !important; border-radius: 8px !important; font-size: 14px !important; background: #fff !important; box-shadow: none !important; line-height: 1.4 !important; height: auto !important; }
-        .wishlist-devis-container .form-group                  { margin: 0 0 12px !important; padding: 0 !important; }
+        .wishlist-devis-container input[type="tel"]            { margin: 0 !important; padding: 10px 14px !important; width: 100% !important; border: 1px solid #d8dce0 !important; border-radius: 8px !important; font-size: 14px !important; background: #fff !important; box-shadow: none !important; line-height: 1.4 !important; height: auto !important; float: none !important; display: block !important; }
+        .wishlist-devis-container .form-group                  { margin: 0 0 12px !important; padding: 0 !important; float: none !important; }
 
         /* --- Grille colonnes --- */
-        .wishlist-devis-container .wd-row                      { display: grid !important; grid-template-columns: 1fr 1fr !important; gap: 12px !important; margin: 0 0 12px !important; }
+        .wishlist-devis-container .wd-row                      { display: grid !important; grid-template-columns: 1fr 1fr !important; gap: 12px !important; margin: 0 0 12px !important; float: none !important; }
         .wishlist-devis-container .wd-row.wd-row-3             { grid-template-columns: 1fr 1fr 1fr !important; }
-        .wishlist-devis-container .wd-row .form-group          { margin-bottom: 0 !important; }
+        .wishlist-devis-container .wd-row .form-group          { margin: 0 !important; }
+        #devis-company-fields                                  { margin: 0 0 12px !important; }
 
         /* --- Boutons segmentés type de client --- */
         .wishlist-devis-container .wd-segmented                { display: flex !important; flex-direction: row !important; gap: 10px !important; margin: 0 !important; padding: 0 !important; }
-        .wishlist-devis-container .wd-seg                      { flex: 1 !important; position: relative !important; margin: 0 !important; padding: 0 !important; cursor: pointer !important; list-style: none !important; }
+        .wishlist-devis-container .wd-seg                      { flex: 1 !important; position: relative !important; margin: 0 !important; padding: 0 !important; cursor: pointer !important; list-style: none !important; float: none !important; }
         .wishlist-devis-container .wd-seg input[type="radio"]  { display: none !important; }
-        .wishlist-devis-container .wd-seg span                 { display: block !important; margin: 0 !important; padding: 10px 14px !important; text-align: center !important; border: 1px solid #d8dce0 !important; border-radius: 8px !important; font-size: 14px !important; font-weight: 600 !important; color: #6b7280 !important; background: #fff !important; cursor: pointer !important; line-height: 1.4 !important; }
+        .wishlist-devis-container .wd-seg span                 { display: block !important; margin: 0 !important; padding: 10px 14px !important; text-align: center !important; border: 1px solid #d8dce0 !important; border-radius: 8px !important; font-size: 14px !important; font-weight: 600 !important; color: #6b7280 !important; background: #fff !important; cursor: pointer !important; line-height: 1.4 !important; float: none !important; }
         .wishlist-devis-container .wd-seg:hover span           { border-color: #ff7a00 !important; color: #ff7a00 !important; background: #fff !important; }
         .wishlist-devis-container .wd-seg input[type="radio"]:checked ~ span { border-color: #ff7a00 !important; background: #ff7a00 !important; color: #fff !important; box-shadow: 0 2px 8px rgba(255,122,0,0.3) !important; }
 

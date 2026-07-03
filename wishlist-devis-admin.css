@@ -1,0 +1,155 @@
+/* ==========================================================================
+   Wishlist Devis Plugin — styles page d'administration
+   ========================================================================== */
+
+/* ---- Variables ---------------------------------------------------------- */
+:root {
+    --wda-brand:   #2B579A;
+    --wda-radius:  6px;
+    --wda-gap:     20px;
+}
+
+/* ---- Grille détail ------------------------------------------------------- */
+.wd-detail-grid {
+    display: grid;
+    grid-template-columns: 1fr 340px;
+    gap: var(--wda-gap);
+    margin-top: 20px;
+}
+
+@media (max-width: 900px) {
+    .wd-detail-grid {
+        grid-template-columns: 1fr;
+    }
+}
+
+/* ---- Cartes -------------------------------------------------------------- */
+.wd-detail-card {
+    background: #fff;
+    border: 1px solid #dcdcdc;
+    border-radius: var(--wda-radius);
+    padding: 20px 24px;
+    margin-bottom: var(--wda-gap);
+}
+
+.wd-detail-card h2 {
+    margin: 0 0 16px;
+    font-size: 14px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--wda-brand);
+    border-bottom: 2px solid var(--wda-brand);
+    padding-bottom: 8px;
+}
+
+/* ---- Lignes info (mode lecture) ----------------------------------------- */
+.wd-info-row {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    padding: 6px 0;
+    border-bottom: 1px solid #f0f0f0;
+    font-size: 13px;
+}
+
+.wd-info-row:last-child {
+    border-bottom: none;
+}
+
+.wd-info-label {
+    flex: 0 0 130px;
+    font-weight: 600;
+    color: #555;
+}
+
+.wd-info-value {
+    flex: 1;
+    color: #1d2327;
+    word-break: break-word;
+}
+
+/* ---- Champs éditables (mode édition) ------------------------------------ */
+.wd-field-row {
+    margin-bottom: 14px;
+}
+
+.wd-field-row label {
+    display: block;
+    font-weight: 600;
+    font-size: 12px;
+    color: #555;
+    margin-bottom: 4px;
+    text-transform: uppercase;
+    letter-spacing: 0.3px;
+}
+
+.wd-field-row input[type="text"],
+.wd-field-row input[type="email"],
+.wd-field-row select {
+    width: 100%;
+    border-radius: var(--wda-radius);
+}
+
+/* ---- Sélecteur statut ---------------------------------------------------- */
+.wd-status-select {
+    width: 100%;
+    border-radius: var(--wda-radius);
+    font-size: 14px;
+}
+
+/* ---- Badges statut dans la liste ---------------------------------------- */
+.wd-status {
+    display: inline-block;
+    padding: 3px 10px;
+    border-radius: 20px;
+    font-size: 12px;
+    font-weight: 600;
+    white-space: nowrap;
+}
+
+.wd-status--a_envoyer           { background: #fff3cd; color: #856404; }
+.wd-status--envoye               { background: #d1ecf1; color: #0c5460; }
+.wd-status--en_attente_reponse   { background: #cce5ff; color: #004085; }
+.wd-status--en_attente_paiement  { background: #d4edda; color: #155724; }
+.wd-status--commande_passee      { background: #d6d8db; color: #1b1e21; }
+.wd-status--annule               { background: #f8d7da; color: #721c24; }
+
+/* ---- Barre d'actions (bas de formulaire) --------------------------------- */
+.wd-action-bar {
+    margin-top: 8px;
+    display: flex;
+    gap: 10px;
+    align-items: center;
+    flex-wrap: wrap;
+}
+
+.wd-delete-link {
+    margin-left: auto;
+    color: #b32d2e !important;
+    text-decoration: none;
+}
+
+.wd-delete-link:hover {
+    text-decoration: underline;
+}
+
+/* ---- Table liste --------------------------------------------------------- */
+.wd-list-table .wd-row-actions {
+    white-space: nowrap;
+}
+
+/* ---- Table produits ------------------------------------------------------ */
+.wd-products-table {
+    font-size: 13px;
+}
+
+.wd-products-table th {
+    background: var(--wda-brand);
+    color: #fff;
+    padding: 6px 10px;
+}
+
+.wd-products-table td {
+    padding: 5px 10px;
+}

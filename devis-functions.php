@@ -3,6 +3,463 @@ if (!defined('ABSPATH')) {
     exit;
 }
 
+/**
+ * Type de client.
+ * 'particulier'   => particulier (nom de société + SIRET masqués/vides)
+ * 'professionnel' => professionnel (nom de société + SIRET attendus)
+ */
+if (!defined('WD_CUSTOMER_TYPE_INDIVIDUAL')) {
+    define('WD_CUSTOMER_TYPE_INDIVIDUAL', 'particulier');
+}
+if (!defined('WD_CUSTOMER_TYPE_PROFESSIONAL')) {
+    define('WD_CUSTOMER_TYPE_PROFESSIONAL', 'professionnel');
+}
+
+// Statuts de devis
+if (!defined('WD_DB_VERSION')) {
+    define('WD_DB_VERSION', '1.2');
+}
+
+/**
+ * Retourne la liste ordonnée des statuts de devis disponibles.
+ *
+ * @return array<string,string> Tableau slug => libellé français.
+ */
+function wishlist_devis_get_statuses()
+{
+    return array(
+        'a_envoyer'           => 'À envoyer',
+        'envoye'              => 'Envoyé',
+        'en_attente_reponse'  => 'En attente de réponse',
+        'en_attente_paiement' => 'En attente de paiement',
+        'commande_passee'     => 'Commande passée',
+        'annule'              => 'Annulé',
+    );
+}
+
+/**
+ * Retourne le libellé français d'un slug de statut.
+ *
+ * @param string $slug Slug du statut.
+ * @return string Libellé, ou le slug original si inconnu.
+ */
+function wishlist_devis_status_label($slug)
+{
+    $statuses = wishlist_devis_get_statuses();
+    return isset($statuses[$slug]) ? $statuses[$slug] : esc_html($slug);
+}
+
+/**
+ * Crée (ou réconcilie) les tables personnalisées du plugin sur activation.
+ *
+ * Crée deux tables :
+ *  - {prefix}wishlist_devis_requests   : une ligne par demande de devis.
+ *  - {prefix}wishlist_devis_references : mapping stable email -> référence 4 chiffres.
+ *
+ * Idempotent : un nouvel appel sur des tables existantes laisse dbDelta()
+ * réconcilier le schéma sans supprimer ni modifier les lignes existantes.
+ *
+ * @return void
+ */
+function wishlist_devis_install_tables()
+{
+    global $wpdb;
+
+    require_once ABSPATH . 'wp-admin/includes/upgrade.php';
+
+    $charset_collate = $wpdb->get_charset_collate();
+
+    $requests_table   = $wpdb->prefix . 'wishlist_devis_requests';
+    $references_table = $wpdb->prefix . 'wishlist_devis_references';
+
+    // Table 1 : demandes de devis (une ligne par soumission).
+    $sql_requests = "CREATE TABLE {$requests_table} (
+        id            BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        reference     CHAR(4)         NOT NULL,
+        customer_type VARCHAR(20)     NOT NULL,
+        company_name  VARCHAR(255)    NOT NULL DEFAULT '',
+        siret         VARCHAR(20)     NOT NULL DEFAULT '',
+        full_name     VARCHAR(255)    NOT NULL,
+        email         VARCHAR(190)    NOT NULL,
+        phone         VARCHAR(40)     NOT NULL DEFAULT '',
+        country       VARCHAR(100)    NOT NULL DEFAULT '',
+        postal_code   VARCHAR(20)     NOT NULL DEFAULT '',
+        city          VARCHAR(120)    NOT NULL DEFAULT '',
+        address       VARCHAR(255)    NOT NULL DEFAULT '',
+        products      LONGTEXT        NOT NULL,
+        status        VARCHAR(40)     NOT NULL DEFAULT 'a_envoyer',
+        created_at    DATETIME        NOT NULL,
+        PRIMARY KEY  (id),
+        KEY email (email),
+        KEY reference (reference)
+    ) {$charset_collate};";
+
+    // Table 2 : mapping stable email -> référence (source de vérité de la numérotation).
+    $sql_references = "CREATE TABLE {$references_table} (
+        email      VARCHAR(190) NOT NULL,
+        reference  CHAR(4)      NOT NULL,
+        created_at DATETIME     NOT NULL,
+        PRIMARY KEY  (email),
+        UNIQUE KEY reference (reference)
+    ) {$charset_collate};";
+
+    dbDelta($sql_requests);
+    dbDelta($sql_references);
+}
+
+/**
+ * Nombre maximal de tentatives d'allocation d'une référence en cas de
+ * collision sur la clé unique (allocations concurrentes).
+ */
+if (!defined('WD_REFERENCE_MAX_ATTEMPTS')) {
+    define('WD_REFERENCE_MAX_ATTEMPTS', 5);
+}
+
+/**
+ * Récupère la référence existante d'un email, ou en alloue une nouvelle.
+ *
+ * Comportement :
+ *  - Chemin rapide : si l'email possède déjà une référence, elle est renvoyée
+ *    telle quelle sans insertion.
+ *  - Sinon, dans une transaction : relecture verrouillée (SELECT ... FOR UPDATE),
+ *    puis SELECT MAX(CAST(reference AS UNSIGNED)), calcul de next = max + 1
+ *    (ou 1 si la table est vide), formatage sur 4 chiffres avec zéros de tête,
+ *    puis insertion. En cas de collision sur la clé unique, nouvelle tentative
+ *    (dans la limite de WD_REFERENCE_MAX_ATTEMPTS).
+ *  - Si next dépasse 9999, aucune insertion : renvoie le sentinelle d'erreur ''
+ *    et journalise via error_log().
+ *
+ * La première référence émise sur une table vide est "0001".
+ *
+ * @param string $email Email assaini, en minuscules, non vide.
+ * @return string Référence 4 chiffres (/^\d{4}$/), ou '' en cas d'échec.
+ */
+function wishlist_devis_get_or_create_reference($email)
+{
+    global $wpdb;
+
+    $references_table = $wpdb->prefix . 'wishlist_devis_references';
+
+    // Chemin rapide : l'email a déjà une référence.
+    $existing = $wpdb->get_var(
+        $wpdb->prepare(
+            "SELECT reference FROM {$references_table} WHERE email = %s",
+            $email
+        )
+    );
+    if ($existing !== null) {
+        return $existing;
+    }
+
+    $attempts = 0;
+    while ($attempts < WD_REFERENCE_MAX_ATTEMPTS) {
+        $wpdb->query('START TRANSACTION');
+
+        // Relecture verrouillée : une autre requête a pu insérer entre-temps.
+        $existing = $wpdb->get_var(
+            $wpdb->prepare(
+                "SELECT reference FROM {$references_table} WHERE email = %s FOR UPDATE",
+                $email
+            )
+        );
+        if ($existing !== null) {
+            $wpdb->query('COMMIT');
+            return $existing;
+        }
+
+        // Plus grande référence actuelle (NULL si table vide).
+        $max_ref = $wpdb->get_var(
+            "SELECT MAX(CAST(reference AS UNSIGNED)) FROM {$references_table}"
+        );
+        if ($max_ref === null) {
+            $next_num = 1; // première référence jamais émise
+        } else {
+            $next_num = (int) $max_ref + 1;
+        }
+
+        // Espace de numérotation épuisé (format 4 chiffres).
+        if ($next_num > 9999) {
+            $wpdb->query('ROLLBACK');
+            error_log(
+                'wishlist_devis_get_or_create_reference: espace de référence épuisé '
+                . '(limite 9999) pour l\'email ' . $email
+            );
+            return '';
+        }
+
+        $reference = str_pad((string) $next_num, 4, '0', STR_PAD_LEFT);
+
+        $inserted = $wpdb->insert(
+            $references_table,
+            array(
+                'email'      => $email,
+                'reference'  => $reference,
+                'created_at' => current_time('mysql', true),
+            ),
+            array('%s', '%s', '%s')
+        );
+
+        if ($inserted) {
+            $wpdb->query('COMMIT');
+            return $reference;
+        }
+
+        // Collision sur la clé unique (reference ou email) : on annule et on retente.
+        $wpdb->query('ROLLBACK');
+        $attempts++;
+    }
+
+    error_log(
+        'wishlist_devis_get_or_create_reference: allocation impossible après '
+        . WD_REFERENCE_MAX_ATTEMPTS . ' tentatives pour l\'email ' . $email
+    );
+    return '';
+}
+
+/**
+ * Valide et assainit la charge utile (payload) d'une soumission de devis.
+ *
+ * Fonction pure vis-à-vis de la base de données : aucune écriture n'est
+ * effectuée. Elle renvoie une structure ValidationResult :
+ *
+ *   array{
+ *       valid:  bool,
+ *       errors: array<string,string>,  // champ => message français
+ *       data:   array|null             // payload assaini si valide, sinon null
+ *   }
+ *
+ * Règles de validité :
+ *  - customer_type ∈ { particulier, professionnel } ;
+ *  - full_name : chaîne non vide après trim ;
+ *  - email : non vide et valide selon is_email() ;
+ *  - products : tableau non vide dont chaque produit a un name non vide
+ *    et une quantity >= 1 ;
+ *  - si professionnel : company_name et siret tous deux non vides.
+ *
+ * Assainissement appliqué lorsque la soumission est valide :
+ *  - email        : sanitize_email() puis strtolower() ;
+ *  - champs texte : sanitize_text_field() ;
+ *  - customer_type: restreint à l'une des constantes autorisées ;
+ *  - siret        : normalisé en chiffres uniquement (conservé en chaîne) ;
+ *  - pour un particulier : company_name et siret forcés à '' quelle que
+ *    soit la valeur soumise ;
+ *  - chaque produit : name via sanitize_text_field(), quantity via intval()
+ *    avec un minimum de 1.
+ *
+ * @param array $payload Corps de requête JSON décodé (clés manquantes/en trop possibles).
+ * @return array ValidationResult.
+ */
+function wishlist_devis_validate_submission($payload)
+{
+    $errors = array();
+
+    if (!is_array($payload)) {
+        $payload = array();
+    }
+
+    // --- customer_type ---
+    $customer_type_raw = isset($payload['customer_type']) ? $payload['customer_type'] : '';
+    $allowed_types     = array(WD_CUSTOMER_TYPE_INDIVIDUAL, WD_CUSTOMER_TYPE_PROFESSIONAL);
+    $is_known_type     = is_string($customer_type_raw) && in_array($customer_type_raw, $allowed_types, true);
+    if (!$is_known_type) {
+        $errors['customer_type'] = 'Le type de client est invalide.';
+    }
+
+    // --- full_name ---
+    $full_name_raw = isset($payload['full_name']) ? $payload['full_name'] : '';
+    $full_name_trimmed = is_string($full_name_raw) ? trim($full_name_raw) : '';
+    if ($full_name_trimmed === '') {
+        $errors['full_name'] = 'Le nom complet est obligatoire.';
+    }
+
+    // --- email ---
+    $email_raw = isset($payload['email']) ? $payload['email'] : '';
+    $email_trimmed = is_string($email_raw) ? trim($email_raw) : '';
+    if ($email_trimmed === '' || !is_email($email_trimmed)) {
+        $errors['email'] = 'Une adresse email valide est obligatoire.';
+    }
+
+    // --- produits ---
+    $products_raw = isset($payload['products']) ? $payload['products'] : null;
+    if (!is_array($products_raw) || count($products_raw) === 0) {
+        $errors['products'] = 'La liste des produits ne peut pas être vide.';
+    } else {
+        // Invariant : tous les produits avant l'indice courant sont valides ;
+        // dès qu'un produit invalide est rencontré, on signale l'erreur et on
+        // arrête la validation produit par produit.
+        foreach ($products_raw as $product) {
+            $name_ok = is_array($product)
+                && isset($product['name'])
+                && is_string($product['name'])
+                && trim($product['name']) !== '';
+
+            $quantity = (is_array($product) && isset($product['quantity']))
+                ? intval($product['quantity'])
+                : 0;
+            $quantity_ok = $quantity >= 1;
+
+            if (!$name_ok || !$quantity_ok) {
+                $errors['products'] = 'Chaque produit doit avoir un nom et une quantité d\'au moins 1.';
+                break;
+            }
+        }
+    }
+
+    // --- champs société (professionnel uniquement) ---
+    $company_name_raw = isset($payload['company_name']) ? $payload['company_name'] : '';
+    $siret_raw        = isset($payload['siret']) ? $payload['siret'] : '';
+    $company_name_trimmed = is_string($company_name_raw) ? trim($company_name_raw) : '';
+    $siret_trimmed        = is_string($siret_raw) ? trim($siret_raw) : '';
+
+    if ($is_known_type && $customer_type_raw === WD_CUSTOMER_TYPE_PROFESSIONAL) {
+        if ($company_name_trimmed === '') {
+            $errors['company_name'] = 'Le nom de société est obligatoire pour un professionnel.';
+        }
+        if ($siret_trimmed === '') {
+            $errors['siret'] = 'Le numéro de SIRET est obligatoire pour un professionnel.';
+        }
+    }
+
+    // En cas d'erreur : pas d'assainissement, data === null.
+    if (!empty($errors)) {
+        return array(
+            'valid'  => false,
+            'errors' => $errors,
+            'data'   => null,
+        );
+    }
+
+    // --- assainissement (soumission valide) ---
+    $customer_type = $customer_type_raw; // déjà restreint aux constantes autorisées
+
+    $sanitized_products = array();
+    foreach ($products_raw as $product) {
+        $sanitized_quantity = intval($product['quantity']);
+        if ($sanitized_quantity < 1) {
+            $sanitized_quantity = 1;
+        }
+
+        $sanitized_product = array(
+            'name'     => sanitize_text_field($product['name']),
+            'quantity' => $sanitized_quantity,
+        );
+
+        // Conserver les champs additionnels connus en les assainissant.
+        if (isset($product['id'])) {
+            $sanitized_product['id'] = sanitize_text_field($product['id']);
+        }
+        if (isset($product['img'])) {
+            $sanitized_product['img'] = sanitize_text_field($product['img']);
+        }
+
+        $sanitized_products[] = $sanitized_product;
+    }
+
+    if ($customer_type === WD_CUSTOMER_TYPE_PROFESSIONAL) {
+        $company_name = sanitize_text_field($company_name_raw);
+        $siret        = preg_replace('/\D+/', '', $siret_raw);
+    } else {
+        // Particulier : société et SIRET forcés à vide quelle que soit l'entrée.
+        $company_name = '';
+        $siret        = '';
+    }
+
+    $data = array(
+        'customer_type' => $customer_type,
+        'company_name'  => $company_name,
+        'siret'         => $siret,
+        'full_name'     => sanitize_text_field($full_name_raw),
+        'email'         => strtolower(sanitize_email($email_raw)),
+        'phone'         => sanitize_text_field(isset($payload['phone']) ? $payload['phone'] : ''),
+        'country'       => sanitize_text_field(isset($payload['country']) ? $payload['country'] : ''),
+        'postal_code'   => sanitize_text_field(isset($payload['postal_code']) ? $payload['postal_code'] : ''),
+        'city'          => sanitize_text_field(isset($payload['city']) ? $payload['city'] : ''),
+        'address'       => sanitize_text_field(isset($payload['address']) ? $payload['address'] : ''),
+        'products'      => $sanitized_products,
+    );
+
+    return array(
+        'valid'  => true,
+        'errors' => array(),
+        'data'   => $data,
+    );
+}
+
+/**
+ * Persiste une demande de devis validée dans {prefix}wishlist_devis_requests.
+ *
+ * Insère exactement une ligne via $wpdb->insert() avec des spécificateurs de
+ * format explicites. Les produits sont stockés au format JSON via
+ * wp_json_encode(), et created_at est positionné à la date/heure MySQL UTC
+ * courante (current_time('mysql', true)). La référence passée en argument
+ * (obtenue depuis wishlist_devis_get_or_create_reference()) est stockée telle
+ * quelle, de sorte qu'un même email donne toujours la même référence.
+ *
+ * Les données fournies sont déjà assainies par le validateur : l'invariant
+ * professionnel/particulier (company_name/siret non vides pour un
+ * professionnel, vides pour un particulier) est simplement persisté tel quel,
+ * sans nouvelle transformation. Des valeurs par défaut (chaîne vide) sont
+ * utilisées pour les champs optionnels manquants.
+ *
+ * @param array  $data      Payload assaini (DevisPayload) issu du validateur.
+ * @param string $reference Référence 4 chiffres (/^\d{4}$/) déjà allouée.
+ * @return int Id auto-incrémenté de la ligne insérée (> 0), ou 0 en cas d'échec.
+ */
+function wishlist_devis_save_request($data, $reference)
+{
+    global $wpdb;
+
+    $requests_table = $wpdb->prefix . 'wishlist_devis_requests';
+
+    if (!is_array($data)) {
+        $data = array();
+    }
+
+    $products = isset($data['products']) ? $data['products'] : array();
+
+    $row = array(
+        'reference'     => $reference,
+        'customer_type' => isset($data['customer_type']) ? $data['customer_type'] : '',
+        'company_name'  => isset($data['company_name']) ? $data['company_name'] : '',
+        'siret'         => isset($data['siret']) ? $data['siret'] : '',
+        'full_name'     => isset($data['full_name']) ? $data['full_name'] : '',
+        'email'         => isset($data['email']) ? $data['email'] : '',
+        'phone'         => isset($data['phone']) ? $data['phone'] : '',
+        'country'       => isset($data['country']) ? $data['country'] : '',
+        'postal_code'   => isset($data['postal_code']) ? $data['postal_code'] : '',
+        'city'          => isset($data['city']) ? $data['city'] : '',
+        'address'       => isset($data['address']) ? $data['address'] : '',
+        'products'      => wp_json_encode($products),
+        'status'        => 'a_envoyer',
+        'created_at'    => current_time('mysql', true),
+    );
+
+    $formats = array(
+        '%s', // reference
+        '%s', // customer_type
+        '%s', // company_name
+        '%s', // siret
+        '%s', // full_name
+        '%s', // email
+        '%s', // phone
+        '%s', // country
+        '%s', // postal_code
+        '%s', // city
+        '%s', // address
+        '%s', // products
+        '%s', // status
+        '%s', // created_at
+    );
+
+    $inserted = $wpdb->insert($requests_table, $row, $formats);
+
+    if ($inserted === false) {
+        return 0;
+    }
+
+    return (int) $wpdb->insert_id;
+}
+
 // Ajouter l'action AJAX
 add_action('wp_ajax_send_devis', 'wishlist_devis_send_email');
 add_action('wp_ajax_nopriv_send_devis', 'wishlist_devis_send_email');
@@ -12,9 +469,44 @@ function wishlist_devis_send_email()
     // mettre date au fuseau de Paris
     date_default_timezone_set('Europe/Paris');
 
-    $data = json_decode(file_get_contents('php://input'), true);
-    if (!$data && empty($data['products'])) {
-        wp_send_json(['message' => 'Aucun produit dans la wishlist'], 400);
+    $payload = json_decode(file_get_contents('php://input'), true);
+    if (!is_array($payload)) {
+        $payload = array();
+    }
+
+    // Validation + sanitisation : remplace l'ancien garde bogué utilisant `&&`.
+    $result = wishlist_devis_validate_submission($payload);
+    if (empty($result['valid'])) {
+        wp_send_json(array(
+            'message' => 'Veuillez corriger les champs indiqués.',
+            'errors'  => $result['errors'],
+        ), 400);
+        return;
+    }
+
+    // Données assainies issues du validateur.
+    $data = $result['data'];
+
+    // Allocation de la référence (réutilisée si l'email est déjà connu).
+    $reference = wishlist_devis_get_or_create_reference($data['email']);
+    if ($reference === '') {
+        wp_send_json(array('message' => 'Numéro de référence indisponible.'), 500);
+        return;
+    }
+
+    // Propager la référence dans $data pour que le générateur .docx
+    // (wishlist_devis_generate_word) puisse l'afficher dans le bloc client.
+    $data['reference'] = $reference;
+
+    // Mapping de compatibilité : le code existant (sujet, email, .docx) lit
+    // $data['name'], mais le nouveau formulaire envoie full_name.
+    $data['name'] = $data['full_name'];
+
+    // Persistance de la demande.
+    $rowId = wishlist_devis_save_request($data, $reference);
+    if ($rowId === 0) {
+        wp_send_json(array('message' => "Échec de l'enregistrement de la demande."), 500);
+        return;
     }
 
     // $admin_email = get_option('wishlist_devis_admin_email');
@@ -28,6 +520,10 @@ function wishlist_devis_send_email()
 
 
     $subject = "Nouvelle demande de devis - " . $data['name'];
+
+    // Libellé français du type de client et indicateur professionnel.
+    $is_professional     = ($data['customer_type'] === WD_CUSTOMER_TYPE_PROFESSIONAL);
+    $customer_type_label = $is_professional ? 'Professionnel' : 'Particulier';
 
     // Construire un email HTML professionnel
     $html_message = '
@@ -98,8 +594,18 @@ function wishlist_devis_send_email()
             
             <div class="client-info">
                 <h3>Informations client :</h3>
-                <p><strong>Nom :</strong> ' . $data['name'] . '</p>
-                <p><strong>Email :</strong> ' . $data['email'] . '</p>
+                <p><strong>Référence :</strong> ' . esc_html($reference) . '</p>
+                <p><strong>Type de client :</strong> ' . esc_html($customer_type_label) . '</p>'
+                . ($is_professional ? '
+                <p><strong>Société :</strong> ' . esc_html($data['company_name']) . '</p>
+                <p><strong>SIRET :</strong> ' . esc_html($data['siret']) . '</p>' : '') . '
+                <p><strong>Nom :</strong> ' . esc_html($data['full_name']) . '</p>
+                <p><strong>Email :</strong> ' . esc_html($data['email']) . '</p>
+                <p><strong>Téléphone :</strong> ' . esc_html($data['phone']) . '</p>
+                <p><strong>Adresse :</strong> ' . esc_html($data['address']) . '</p>
+                <p><strong>Code postal :</strong> ' . esc_html($data['postal_code']) . '</p>
+                <p><strong>Ville :</strong> ' . esc_html($data['city']) . '</p>
+                <p><strong>Pays :</strong> ' . esc_html($data['country']) . '</p>
                 <p><strong>Date de la demande :</strong> ' . date('d/m/Y à H:i') . '</p>
             </div>
             
@@ -126,13 +632,11 @@ function wishlist_devis_send_email()
             
             <p>Le devis Au format Word est joint à cet email.</p>
             
-            <p>Pour visualiser tous les détails du devis, merci d\'ouvrir le document Word joint à cet email.</p>
-            
             <p>Cordialement,<br>Le système automatique de devis</p>
         </div>
         <div class="footer">
             <p>Ce message a été généré automatiquement par le site <a href="https://www.jbadev.com/">https://www.jbadev.com/</a></p>
-            <p>&copy; ' . date('Y') . ' JBADev. Tous droits réservés.</p>
+            <p>&copy; ' . date('Y') . ' JB AdeV. Tous droits réservés.</p>
         </div>
     </body>
     </html>';
@@ -140,8 +644,19 @@ function wishlist_devis_send_email()
     // Version texte brut comme fallback pour les clients email qui ne supportent pas l'HTML
     $text_message = "Nouvelle demande de devis\n\n";
     $text_message .= "Informations client :\n";
-    $text_message .= "Nom : " . $data['name'] . "\n";
+    $text_message .= "Référence : " . $reference . "\n";
+    $text_message .= "Type de client : " . $customer_type_label . "\n";
+    if ($is_professional) {
+        $text_message .= "Société : " . $data['company_name'] . "\n";
+        $text_message .= "SIRET : " . $data['siret'] . "\n";
+    }
+    $text_message .= "Nom : " . $data['full_name'] . "\n";
     $text_message .= "Email : " . $data['email'] . "\n";
+    $text_message .= "Téléphone : " . $data['phone'] . "\n";
+    $text_message .= "Adresse : " . $data['address'] . "\n";
+    $text_message .= "Code postal : " . $data['postal_code'] . "\n";
+    $text_message .= "Ville : " . $data['city'] . "\n";
+    $text_message .= "Pays : " . $data['country'] . "\n";
     $text_message .= "Date de la demande : " . date('d/m/Y à H:i') . "\n\n";
     $text_message .= "Produits demandés :\n";
 
@@ -159,7 +674,7 @@ function wishlist_devis_send_email()
     // Envoi de l'email avec pièce jointe
     $headers = [
         'Content-Type: text/html; charset=UTF-8',
-        'From: JBADev <wordpress@jbadev.com>'
+        'From: JB AdeV - Site web <wordpress@jbadev.com>'
     ];
 
     $attachments = [$file_path];
@@ -169,9 +684,9 @@ function wishlist_devis_send_email()
     $mail_sent2 = wp_mail($admin_email2, $subject, $html_message, $headers, $attachments);
 
     if ($mail_sent) {
-        wp_send_json(['message' => 'Votre demande de devis a été envoyée avec succès.']);
+        wp_send_json(['message' => "Votre demande (réf. $reference) a bien été envoyée."]);
     } else {
-        wp_send_json(['message' => 'Erreur lors de l\'envoi de l\'email.'], 500);
+        wp_send_json(['message' => "Demande enregistrée (réf. $reference), mais l'email n'a pas pu être envoyé."], 500);
     }
 }
 
@@ -186,15 +701,19 @@ function wishlist_devis_generate_word($products, $data)
     // Créer un nouveau document PHPWord
     $phpWord = new \PhpOffice\PhpWord\PhpWord();
 
-    // Ajouter des styles au document
+    // Ajouter des styles au document - Version améliorée
     $fontStyle = ['name' => 'Arial', 'size' => 11];
-    $headerStyle = ['name' => 'Arial', 'size' => 20, 'bold' => true, 'color' => '2B579A'];
+    $headerStyle = ['name' => 'Arial', 'size' => 22, 'bold' => true, 'color' => '2B579A'];
     $subHeaderStyle = ['name' => 'Arial', 'size' => 14, 'bold' => true, 'color' => '2B579A'];
     $tableHeaderStyle = ['name' => 'Arial', 'size' => 11, 'bold' => true, 'color' => 'FFFFFF'];
+    $redTextStyle = ['name' => 'Arial', 'size' => 12, 'bold' => true, 'color' => 'FF0000'];
+    $smallRedTextStyle = ['name' => 'Arial', 'size' => 10, 'bold' => true, 'color' => 'FF0000'];
+    $madeInFranceStyle = ['name' => 'Arial', 'size' => 10, 'bold' => true, 'color' => '2B579A'];
+
     $tableStyle = [
-        'borderSize' => 6,
+        'borderSize' => 8,
         'borderColor' => '2B579A',
-        'cellMargin' => 80,
+        'cellMargin' => 120,
         'alignment' => \PhpOffice\PhpWord\SimpleType\JcTable::CENTER
     ];
     $cellStyle = ['valign' => 'center'];
@@ -202,21 +721,21 @@ function wishlist_devis_generate_word($products, $data)
 
     // Définir les propriétés du document
     $properties = $phpWord->getDocInfo();
-    $properties->setCreator('JBADev');
-    $properties->setCompany('JBADev');
-    $properties->setTitle('Devis');
+    $properties->setCreator('JB AdeV');
+    $properties->setCompany('JB AdeV');
+    $properties->setTitle('Devis Professionnel');
     $properties->setDescription('Devis généré pour ' . $data['name']);
     $properties->setCategory('Devis');
 
-    // Ajouter une section au document
+    // Ajouter une section au document avec des marges optimisées
     $section = $phpWord->addSection([
-        'marginTop' => 1000,
+        'marginTop' => 800,
         'marginRight' => 1000,
         'marginBottom' => 1000,
         'marginLeft' => 1000,
     ]);
 
-    // Ajouter un en-tête avec le logo
+    // Ajouter un en-tête professionnel avec le logo
     $header = $section->addHeader();
     $headerTable = $header->addTable();
     $headerTable->addRow();
@@ -239,80 +758,122 @@ function wishlist_devis_generate_word($products, $data)
     }
 
     if (file_exists($logo_path)) {
-        $logoCell->addImage($logo_path, ['width' => 100]);
+        $logoCell->addImage($logo_path, ['width' => 120]);
     }
 
-    // Informations entreprise à droite
+    // Informations entreprise à droite - Version améliorée
     $companyCell = $headerTable->addCell(7000);
-    $companyCell->addText('', ['size' => 14]);
-    $companyCell->addText('JBADev', ['bold' => true, 'size' => 14, 'color' => '2B579A']);
-    $companyCell->addText('15 bis rue du Capitaine le Drezen, 29730 TREFFIAGAT FRANCE', ['size' => 10]);
-    $companyCell->addText('Tél: +33 7 86 30 26 76 | Email: jbastierdevillatte@gmail.com', ['size' => 10]);
+    $companyCell->addText('JB AdeV, créations depuis 1993', ['bold' => true, 'size' => 16, 'color' => '2B579A']);
+    $companyCell->addText('éditeur exclusif des œuvres originales de Jean-Baptiste Astier de Villatte', ['size' => 11, 'italic' => true]);
+    $companyCell->addTextBreak(1);
+    $companyCell->addText('RCS: 342 131 943 00082 | n° de TVA FR 41342131943', ['size' => 10, 'color' => '666666']);
+    $companyCell->addText('15 bis rue du Capitaine le Drezen, 29730 TREFFIAGAT FRANCE', ['size' => 10, 'color' => '666666']);
+    $companyCell->addText('Tél: +33 7 86 30 26 76 | Email: jbastierdevillatte@gmail.com', ['size' => 10, 'color' => '666666']);
 
-    $headerTable->addRow(6);
-    $headerTable->addCell(3000)->addText('');
-
-    // Ajouter un pied de page
-    // $footer = $section->addFooter();
-    // $footer->addText('Devis généré le ' . date('d/m/Y'), ['size' => 8, 'italic' => true], ['alignment' => 'center']);
-    // $footer->addText('JBADev - SIRET 123 456 789 00010', ['size' => 8], ['alignment' => 'center']);
-
-    // Ajouter un séparateur après l'en-tête
-    // $section->addText('', ['size' => 6]);
-    $section->addLine(['weight' => 1, 'width' => 450, 'height' => 0, 'color' => '2B579A']);
-    // $section->addText('', ['size' => 6]);
-
-    // Titre du document avec numéro de devis
-    $devisNumber = 'DV-' . date('Ymd') . '-' . rand(1000, 9999);
-    $section->addText('DEVIS', $headerStyle, ['alignment' => 'center']);
-    $section->addText('N° ' . $devisNumber, ['name' => 'Arial', 'size' => 12, 'bold' => true], ['alignment' => 'center']);
+    // Ajouter un séparateur élégant après l'en-tête
+    $section->addTextBreak(1);
+    $section->addLine(['weight' => 2, 'width' => 450, 'height' => 0, 'color' => '2B579A']);
     $section->addTextBreak(1);
 
-    // Ajouter les informations du client dans un cadre
-    $clientInfoTable = $section->addTable(['borderSize' => 1, 'borderColor' => '2B579A', 'cellMargin' => 80]);
+    // Titre du document avec numéro de devis et mention "À confirmer"
+    $date = new DateTime();
+    $formatter = new IntlDateFormatter('fr_FR', IntlDateFormatter::LONG, IntlDateFormatter::NONE);
+
+    // Créer un tableau pour aligner proforma et "À confirmer"
+    $titleTable = $section->addTable();
+    $titleTable->addRow();
+    $titleTable->addCell(5000)->addText('proforma n°: ' . date('Y m'), $headerStyle, ['alignment' => 'left']);
+    $titleTable->addCell(5000)->addText('À CONFIRMER', $redTextStyle, ['alignment' => 'right']);
+
+    // Ligne contenant la date (centrée) et le coq + "MADE IN FRANCE"
+    $topTable = $section->addTable(['alignment' => 'center']);
+    $topTable->addRow();
+
+    // Cellule pour la date
+    $dateCell = $topTable->addCell(7000);
+    $dateCell->addText(
+        'date: ' . $formatter->format($date),
+        ['name' => 'Arial', 'size' => 12, 'bold' => true],
+        ['alignment' => 'center']
+    );
+
+    // Cellule pour l'image du coq + texte dessous
+    $coqCell = $topTable->addCell(3000, ['valign' => 'center']);
+
+    // Ajouter l'image du coq
+    $coq_path = plugin_dir_path(__FILE__) . 'assets/coq.jpg';
+    if (file_exists($coq_path)) {
+        $coqCell->addImage($coq_path, ['width' => 50, 'alignment' => 'center']);
+    }
+
+    // Ajouter le texte "MADE IN FRANCE" sous le coq
+    $coqCell->addText(
+        'MADE IN FRANCE',
+        $madeInFranceStyle,
+        ['alignment' => 'center']
+    );
+
+    $section->addTextBreak(1);
+
+    // Ajouter les informations du client dans un cadre professionnel
+    $clientInfoTable = $section->addTable(['borderSize' => 2, 'borderColor' => '2B579A', 'cellMargin' => 80]);
     $clientInfoTable->addRow();
-    $clientCell = $clientInfoTable->addCell(9000);
-    $clientCell->addText('INFORMATIONS CLIENT', ['name' => 'Arial', 'size' => 12, 'bold' => true, 'color' => '2B579A']);
-    $clientCell->addText('Nom: ' . $data['name'], $fontStyle);
-    $clientCell->addText('Email: ' . $data['email'], $fontStyle);
-    $clientCell->addText('Date du devis: ' . date('d/m/Y'), $fontStyle);
-    // $clientCell->addText('Validité: 30 jours', $fontStyle);
-    $section->addTextBreak(1);
+    $clientCell = $clientInfoTable->addCell(9000, ['bgColor' => 'F8F9FA']);
+    $clientCell->addText('INFORMATIONS CLIENT', ['name' => 'Arial', 'size' => 13, 'bold' => true, 'color' => '2B579A']);
+    // $clientCell->addTextBreak(1);
+    $wd_label_style         = ['name' => 'Arial', 'size' => 12];
+    $wd_bold_style          = ['name' => 'Arial', 'size' => 12, 'bold' => true];
+    $wd_customer_type       = isset($data['customer_type']) ? $data['customer_type'] : '';
+    $wd_customer_type_label = ($wd_customer_type === WD_CUSTOMER_TYPE_PROFESSIONAL) ? 'Professionnel' : 'Particulier';
+
+    if (isset($data['reference']) && $data['reference'] !== '') {
+        $clientCell->addText('Référence: ' . $data['reference'], $wd_bold_style);
+    }
+    $clientCell->addText('Type de client: ' . $wd_customer_type_label, $wd_label_style);
+    if ($wd_customer_type === WD_CUSTOMER_TYPE_PROFESSIONAL) {
+        $clientCell->addText('Société: ' . (isset($data['company_name']) ? $data['company_name'] : ''), $wd_label_style);
+        $clientCell->addText('SIRET: ' . (isset($data['siret']) ? $data['siret'] : ''), $wd_label_style);
+    }
+    $wd_full_name = isset($data['full_name']) ? $data['full_name'] : (isset($data['name']) ? $data['name'] : '');
+    $clientCell->addText('Nom: ' . $wd_full_name, $wd_bold_style);
+    $clientCell->addText('Email: ' . $data['email'], $wd_label_style);
+    $clientCell->addText('Téléphone: ' . (isset($data['phone']) ? $data['phone'] : ''), $wd_label_style);
+    $clientCell->addText('Adresse: ' . (isset($data['address']) ? $data['address'] : ''), $wd_label_style);
+    $clientCell->addText('Code postal: ' . (isset($data['postal_code']) ? $data['postal_code'] : ''), $wd_label_style);
+    $clientCell->addText('Ville: ' . (isset($data['city']) ? $data['city'] : ''), $wd_label_style);
+    $clientCell->addText('Pays: ' . (isset($data['country']) ? $data['country'] : ''), $wd_label_style);
+    $section->addTextBreak(2);
 
     // Récupérer les données du fichier Excel
     $excelData = get_excel_data();
-
-    // Texte d'introduction
-    $section->addText('Nous vous remercions pour votre demande de devis. Veuillez trouver ci-dessous le détail des produits sélectionnés :', ['name' => 'Arial', 'size' => 11, 'italic' => true]);
-    $section->addTextBreak(1);
 
     // Créer une table pour les produits avec un style amélioré
     $table = $section->addTable($tableStyle);
 
     // En-têtes de la table avec fond coloré
-    $table->addRow(500); // Hauteur de ligne fixe pour l'en-tête
+    $table->addRow(600); // Hauteur de ligne fixe pour l'en-tête
+    $table->addCell(2000, $cellBoldStyle)->addText('Créateur', $tableHeaderStyle);
     $table->addCell(2000, $cellBoldStyle)->addText('Référence', $tableHeaderStyle);
     $table->addCell(2800, $cellBoldStyle)->addText('Désignation', $tableHeaderStyle);
-    $table->addCell(1100, $cellBoldStyle)->addText('Quantité', $tableHeaderStyle);
-    $table->addCell(1000, $cellBoldStyle)->addText('Prix HT', $tableHeaderStyle);
-    $table->addCell(1200, $cellBoldStyle)->addText('Total HT', $tableHeaderStyle);
+    $table->addCell(1100, $cellBoldStyle)->addText('Qu.', $tableHeaderStyle);
+    $table->addCell(1000, $cellBoldStyle)->addText('tarif unitaire', $tableHeaderStyle);
+    $table->addCell(1200, $cellBoldStyle)->addText('Total', $tableHeaderStyle);
     $table->addCell(1800, $cellBoldStyle)->addText('Image', $tableHeaderStyle);
 
-    // Parcourir les produits
+    // Parcourir les produits (code existant maintenu)
     $totalHT = 0;
     $rowCount = 0;
 
-    $all_references = []; // Tableau pour stocker toutes les références uniques
-    $all_references_quantities = []; // Tableau pour stocker les quantités cumulées par référence
-    $all_references_images = []; // Tableau pour stocker les images associées à chaque référence
-    $all_references_is_single = []; // Pour suivre si une référence apparaît seule dans un produit
+    $all_references = [];
+    $all_references_quantities = [];
+    $all_references_images = [];
+    $all_references_is_single = [];
 
     // Première passe: identifier les références qui apparaissent seules dans un produit
     foreach ($products as $product) {
         $product_name = trim($product['name']);
         $product_image = isset($product['img']) ? $product['img'] : 'N/A';
 
-        // Vérifier si ce produit contient une seule référence
         $temp_references = [];
 
         if (strpos($product_name, '&') !== false) {
@@ -326,11 +887,9 @@ function wishlist_devis_generate_word($products, $data)
             }
         }
 
-        // Si une seule référence est trouvée dans ce produit
         if (count($temp_references) === 1) {
             $ref = trim($temp_references[0]);
 
-            // Standardiser la référence
             if (!empty($ref) && strlen($ref) > 0) {
                 if (preg_match('/^([A-Za-z]{1,2})/', $ref, $matches)) {
                     $prefix = $matches[1];
@@ -342,11 +901,9 @@ function wishlist_devis_generate_word($products, $data)
                 $standardized_ref = $ref;
             }
 
-            // Extraire les composants et créer la clé standard
             $ref_components = preg_split('/\s+/', $standardized_ref);
             $standard_key = implode('_', $ref_components);
 
-            // Marquer cette référence comme apparaissant seule et sauvegarder son image
             $all_references_is_single[$standard_key] = true;
             $all_references_images[$standard_key] = $product_image;
         }
@@ -354,42 +911,31 @@ function wishlist_devis_generate_word($products, $data)
 
     // Deuxième passe: traiter toutes les références et gérer les doublons
     foreach ($products as $product) {
-        // Récupérer la quantité (avec 1 comme valeur par défaut)
         $quantity = isset($product['quantity']) ? intval($product['quantity']) : 1;
         $product_name = trim($product['name']);
         $product_image = isset($product['img']) ? $product['img'] : 'N/A';
 
-        // Vérifier s'il s'agit de références multiples (séparées par ou non par "&")
-        // et les diviser en conséquence
         $product_name = trim($product['name']);
         $temp_references = [];
         $unique_references = [];
         $reference_quantities = [];
 
-        // D'abord, diviser par le séparateur "&" s'il est présent
         if (strpos($product_name, '&') !== false) {
             $temp_references = array_map('trim', explode('&', $product_name));
         } else {
-            // Sinon, utiliser une expression régulière pour trouver les motifs de référence
-            // La lettre peut être majuscule ou minuscule
             $pattern = '/([A-Za-z](?:\s+\d+){2,4})/';
 
             if (preg_match_all($pattern, $product_name, $matches)) {
                 $temp_references = $matches[0];
             } else {
-                // Si aucun motif n'est trouvé, utiliser la chaîne complète
                 $temp_references = [$product_name];
             }
         }
 
-        // Normaliser et dédupliquer les références
         foreach ($temp_references as $ref) {
             $ref = trim($ref);
 
-            // Standardiser la référence pour comparaison
-            // 1. Convertir la ou les première(s) lettre(s) en majuscule
             if (!empty($ref) && strlen($ref) > 0) {
-                // Détection si le préfixe est de 1 ou 2 lettres
                 if (preg_match('/^([A-Za-z]{1,2})/', $ref, $matches)) {
                     $prefix = $matches[1];
                     $standardized_ref = strtoupper($prefix) . substr($ref, strlen($prefix));
@@ -400,74 +946,55 @@ function wishlist_devis_generate_word($products, $data)
                 $standardized_ref = $ref;
             }
 
-            // 2. Extraire les composants de la référence pour une comparaison structurée
             $ref_components = preg_split('/\s+/', $standardized_ref);
-
-            // Reconstruire la référence standardisée avec les composants
             $standard_key = implode('_', $ref_components);
 
-            // On cumule les quantités si la référence existe déjà globalement
             if (isset($all_references[$standard_key])) {
-                // On ajoute la quantité actuelle à la quantité déjà enregistrée
                 $all_references_quantities[$standard_key] += $quantity;
-                // Ne pas modifier l'image si cette référence apparaît seule dans un autre produit
-                // L'image a déjà été définie dans la première passe si applicable
             } else {
-                // Nouvelle référence, l'ajouter à notre tableau global avec sa quantité
                 $all_references[$standard_key] = $standardized_ref;
                 $all_references_quantities[$standard_key] = $quantity;
 
-                // Si cette référence n'a pas déjà une image associée (depuis la première passe)
                 if (!isset($all_references_images[$standard_key])) {
                     $all_references_images[$standard_key] = $product_image;
                 }
 
-                // Et aussi l'ajouter au tableau local pour traitement dans cette itération
                 $unique_references[$standard_key] = $standardized_ref;
                 $reference_quantities[$standard_key] = $quantity;
             }
 
-            // Vérifier si cette référence existe déjà
             if (isset($reference_quantities[$standard_key])) {
-                // Référence déjà vue, incrémenter la quantité
                 $reference_quantities[$standard_key] += $quantity;
             } else {
-                // Nouvelle référence, l'ajouter à notre liste
                 $unique_references[$standard_key] = $standardized_ref;
                 $reference_quantities[$standard_key] = $quantity;
             }
         }
     }
 
-    // Après avoir traité tous les produits, on génère le tableau avec les références uniques
+    // Génération du tableau avec les références uniques
     $rowCount = 0;
     $totalHT = 0;
     foreach ($all_references as $key => $ref) {
-        // Récupérer les informations associées à cette référence
         $ref_quantity = $all_references_quantities[$key];
         $ref_image = $all_references_images[$key];
 
-        // Extraire les composants pour traitement
         $ref_components = preg_split('/\s+/', $ref);
 
-        // Déterminer si le préfixe est 1 ou 2 lettres
         if (preg_match('/^([A-Za-z]{1,2})/', $ref_components[0], $matches)) {
             $letter = strtoupper($matches[1]);
         } else {
             $letter = strtoupper(substr($ref_components[0], 0, 1));
         }
 
-        // Initialiser les numéros avec des valeurs par défaut
         $num1 = isset($ref_components[1]) ? $ref_components[1] : '';
         $num2 = isset($ref_components[2]) ? $ref_components[2] : '';
         $num3 = isset($ref_components[3]) ? $ref_components[3] : '';
 
-        // Rechercher les infos dans les données Excel
         $price = '';
         $designation = '';
 
         foreach ($excelData as $row) {
-            // Essayer de faire correspondre les composants disponibles
             if (
                 $row['letter'] == $letter &&
                 (empty($num1) || $row['num1'] == $num1) &&
@@ -476,41 +1003,35 @@ function wishlist_devis_generate_word($products, $data)
             ) {
 
                 $price = $row['price'];
-                $designation = $row['designation'];
+                $designation = $row['designation'] . ' | ' . $row['collection'] . ' | ' . $row['finition'] . ' | dimensions: ' . $row['dimension'];
                 break;
             }
         }
 
-        // Alterner les couleurs de ligne pour une meilleure lisibilité
         $rowCount++;
         $cellRowStyle = $cellStyle;
         if ($rowCount % 2 == 0) {
-            $cellRowStyle = array_merge($cellStyle, ['bgColor' => 'F2F2F2']);
+            $cellRowStyle = array_merge($cellStyle, ['bgColor' => 'F8F9FA']);
         }
 
-        // Vérifier si le prix est valide
-        $price = str_replace(',', '.', $price); // Remplacer la virgule par un point pour la conversion
+        $price = str_replace(',', '.', $price);
         $price = floatval($price);
-        // Vérifier si le prix est valide
         if ($price === 0) {
-            $price = 0; // Si le prix est invalide, le mettre à 0
+            $price = 0;
         }
 
-        // Ajouter la ligne produit
         $table->addRow();
-        $table->addCell(2000, $cellRowStyle)->addText($ref, $fontStyle);
+        $table->addCell(400, $cellRowStyle)->addText('JB AdeV', $fontStyle);
+        $table->addCell(1600, $cellRowStyle)->addText($ref, $fontStyle);
         $table->addCell(2800, $cellRowStyle)->addText($designation, $fontStyle);
         $table->addCell(1100, $cellRowStyle)->addText($ref_quantity, $fontStyle);
         $table->addCell(1000, $cellRowStyle)->addText($price . ' €', $fontStyle);
 
-        // Calculer et ajouter le total par ligne
         $lineTotal = $price * $ref_quantity;
         $table->addCell(1200, $cellRowStyle)->addText(number_format($lineTotal, 2, ',', ' ') . ' €', $fontStyle);
 
-        // Ajouter l'image si disponible
         $cell = $table->addCell(1800, $cellRowStyle);
         if (!empty($ref_image) && $ref_image !== 'N/A') {
-            // Convertir l'URL de l'image en chemin local si nécessaire
             $img_path = convert_url_to_path($ref_image);
             if ($img_path) {
                 try {
@@ -525,61 +1046,109 @@ function wishlist_devis_generate_word($products, $data)
             $cell->addText('Image non disponible', $fontStyle);
         }
 
-        // Ajouter au total HT
         $totalHT += (float)$price * $ref_quantity;
     }
 
-    // Ajouter le total dans un tableau dédié pour une meilleure présentation
+    // Tableau des totaux amélioré avec nouvelles lignes demandées
     $section->addTextBreak(1);
 
-    $totalTable = $section->addTable(['borderSize' => 0, 'cellMargin' => 80, 'alignment' => \PhpOffice\PhpWord\SimpleType\JcTable::END]);
+    $totalTable = $section->addTable([
+        'borderSize' => 2,
+        'borderColor' => '2B579A',
+        'cellMargin' => 100,
+        'alignment' => \PhpOffice\PhpWord\SimpleType\JcTable::END
+    ]);
 
     // Total HT
     $totalTable->addRow();
-    $totalTable->addCell(3000, ['borderBottomSize' => 1, 'borderBottomColor' => '2B579A'])->addText('Total HT', ['bold' => true]);
-    $totalTable->addCell(2000, ['borderBottomSize' => 1, 'borderBottomColor' => '2B579A'])->addText(number_format($totalHT, 2, ',', ' ') . ' €', ['bold' => true]);
+    $totalTable->addCell(3000, ['borderBottomSize' => 1, 'borderBottomColor' => '2B579A', 'bgColor' => 'F8F9FA'])
+        ->addText('Total HT', ['bold' => true, 'size' => 12]);
+    $totalTable->addCell(2000, ['borderBottomSize' => 1, 'borderBottomColor' => '2B579A', 'bgColor' => 'F8F9FA'])
+        ->addText(number_format($totalHT, 2, ',', ' ') . ' €', ['bold' => true, 'size' => 12]);
+
+    // Emballage 5%
+    $emballage = $totalHT * 0.05;
+    $totalTable->addRow();
+    $totalTable->addCell(3000, ['borderBottomSize' => 1, 'borderBottomColor' => '2B579A'])
+        ->addText('Emballage 5%', $fontStyle);
+    $totalTable->addCell(2000, ['borderBottomSize' => 1, 'borderBottomColor' => '2B579A'])
+        ->addText(number_format($emballage, 2, ',', ' ') . ' €', $fontStyle);
+
+    // Nouveau total HT avec emballage
+    $totalHTAvecEmballage = $totalHT + $emballage;
+    $totalTable->addRow();
+    $totalTable->addCell(3000, ['borderBottomSize' => 1, 'borderBottomColor' => '2B579A', 'bgColor' => 'F8F9FA'])
+        ->addText('Sous-total HT', ['bold' => true, 'size' => 12]);
+    $totalTable->addCell(2000, ['borderBottomSize' => 1, 'borderBottomColor' => '2B579A', 'bgColor' => 'F8F9FA'])
+        ->addText(number_format($totalHTAvecEmballage, 2, ',', ' ') . ' €', ['bold' => true, 'size' => 12]);
 
     // TVA
-    $tva = $totalHT * 0.2;
+    $tva = $totalHTAvecEmballage * 0.2;
     $totalTable->addRow();
-    $totalTable->addCell(3000, ['borderBottomSize' => 1, 'borderBottomColor' => '2B579A'])->addText('TVA (20%)', $fontStyle);
-    $totalTable->addCell(2000, ['borderBottomSize' => 1, 'borderBottomColor' => '2B579A'])->addText(number_format($tva, 2, ',', ' ') . ' €', $fontStyle);
+    $totalTable->addCell(3000, ['borderBottomSize' => 1, 'borderBottomColor' => '2B579A'])
+        ->addText('TVA (20%)', $fontStyle);
+    $totalTable->addCell(2000, ['borderBottomSize' => 1, 'borderBottomColor' => '2B579A'])
+        ->addText(number_format($tva, 2, ',', ' ') . ' €', $fontStyle);
 
     // Total TTC
-    $totalTTC = $totalHT * 1.2;
+    $totalTTC = $totalHTAvecEmballage * 1.2;
     $totalTable->addRow();
-    $totalTable->addCell(3000, ['borderBottomSize' => 2, 'borderBottomColor' => '2B579A'])->addText('Total TTC', ['bold' => true, 'size' => 12]);
-    $totalTable->addCell(2000, ['borderBottomSize' => 2, 'borderBottomColor' => '2B579A'])->addText(number_format($totalTTC, 2, ',', ' ') . ' €', ['bold' => true, 'size' => 12]);
+    $totalTable->addCell(3000, ['borderBottomSize' => 2, 'borderBottomColor' => '2B579A', 'bgColor' => '2B579A'])
+        ->addText('Total TTC', ['bold' => true, 'size' => 13, 'color' => 'FFFFFF']);
+    $totalTable->addCell(2000, ['borderBottomSize' => 2, 'borderBottomColor' => '2B579A', 'bgColor' => '2B579A'])
+        ->addText(number_format($totalTTC, 2, ',', ' ') . ' €', ['bold' => true, 'size' => 13, 'color' => 'FFFFFF']);
 
-    // Ajouter les conditions du devis
-    // $section->addTextBreak(1);
-    // $section->addText('CONDITIONS DU DEVIS', $subHeaderStyle);
+    // Acomptes versés
+    $totalTable->addRow();
+    $totalTable->addCell(3000, ['borderBottomSize' => 1, 'borderBottomColor' => '2B579A'])
+        ->addText('Acomptes versés', $fontStyle);
+    $totalTable->addCell(2000, ['borderBottomSize' => 1, 'borderBottomColor' => '2B579A'])
+        ->addText('0 €', $fontStyle);
 
-    // $conditionsTable = $section->addTable(['borderSize' => 1, 'borderColor' => '2B579A', 'cellMargin' => 80]);
-    // $conditionsTable->addRow();
-    // $condCell = $conditionsTable->addCell(9000);
-    // $condCell->addText('Validité du devis : 30 jours à compter de la date d\'émission', $fontStyle);
-    // $condCell->addText('Délai de livraison : 2 à 3 semaines à compter de la validation de la commande', $fontStyle);
-    // $condCell->addText('Conditions de paiement : 50% à la commande, solde à la livraison', $fontStyle);
-    // $condCell->addText('Garantie : Tous nos produits sont garantis 1 an pièces et main d\'œuvre', $fontStyle);
-
-    // Note de bas de page
     $section->addTextBreak(1);
-    $section->addText('Pour valider ce devis, merci de nous le retourner signé avec la mention "Bon pour accord".', ['italic' => true, 'size' => 10]);
-    $section->addText('Nous vous remercions de votre confiance et restons à votre disposition pour tout renseignement complémentaire.', ['italic' => true, 'size' => 10]);
 
-    // Signature
+    // Acompte de confirmation en rouge
+    $acompte50 = $totalTTC * 0.5;
+    $section->addText('Suivant l\'usage, acompte de confirmation de 50%, en votre aimable règlement: ' .
+        number_format($acompte50, 2, ',', ' ') . ' €', $redTextStyle, ['alignment' => 'center']);
+
     $section->addTextBreak(2);
-    $signatureTable = $section->addTable();
-    $signatureTable->addRow();
-    $signatureTable->addCell(4500)->addText('Signature du client :', ['bold' => true]);
-    // $signatureTable->addCell(4500)->addText('Pour JBADev :', ['bold' => true]);
+
+    // Ajouter les informations bancaires et conditions
+    $conditionsTable = $section->addTable(['borderSize' => 2, 'borderColor' => '2B579A', 'cellMargin' => 100]);
+    $conditionsTable->addRow();
+    $conditionsCell = $conditionsTable->addCell(10000, ['bgColor' => 'FFFACD']);
+
+    $conditionsCell->addText('CONDITIONS DE VENTE:', ['bold' => true, 'size' => 12, 'color' => '2B579A']);
+    $conditionsCell->addText('acompte de confirmation à la commande: 50%', ['size' => 11]);
+    $conditionsCell->addText('emballage en sus', ['size' => 11]);
+    $conditionsCell->addText('transport à la charge du client destinataire', ['size' => 11]);
+    $conditionsCell->addText('solde avant livraison par virement swift express', ['size' => 11]);
+
+    $conditionsCell->addTextBreak(1);
+
+    $conditionsCell->addText('RIB:', ['bold' => true, 'size' => 12, 'color' => '2B579A']);
+    $conditionsCell->addText('bénéficiaire: Jean-Baptiste Astier de Villatte', ['size' => 11]);
+    $conditionsCell->addText('banque: Crédit Agricole du Finistère', ['size' => 11]);
+    $conditionsCell->addText('Agence du Guilvinec (00040)', ['size' => 11]);
+    $conditionsCell->addText('code IBAN: FR76 1290 6000 4057 4655 8576 747', ['size' => 11, 'bold' => true]);
+    $conditionsCell->addText('code BIC: AGRIFRPP829', ['size' => 11]);
+    $conditionsCell->addText('code banque: 12906', ['size' => 11]);
+    $conditionsCell->addText('code guichet: 00040', ['size' => 11]);
+    $conditionsCell->addText('n° de compte: 57465585767', ['size' => 11]);
+    $conditionsCell->addText('clé RIB: 47', ['size' => 11]);
+
+    $conditionsCell->addTextBreak(1);
+    $conditionsCell->addText(
+        'En cas de retard de paiement, seront exigibles, conformément à l\'article L 441-6 du code de commerce, une indemnité calculée sur la base de trois fois le taux de l\'intérêt légal en vigueur ainsi qu\'une indemnité forfaitaire pour frais de recouvrement de 40 euros.',
+        ['size' => 10, 'italic' => true]
+    );
 
     // Générer le fichier
     $objWriter = \PhpOffice\PhpWord\IOFactory::createWriter($phpWord, 'Word2007');
 
     $upload_dir = wp_upload_dir();
-    $file_name = 'Devis_JBADev_' . date('Ymd_His') . '.docx';
+    $file_name = 'Devis_JBAdeV_' . date('Ymd_His') . '.docx';
     $file_path = $upload_dir['path'] . '/' . $file_name;
 
     $objWriter->save($file_path);
@@ -616,13 +1185,16 @@ function get_excel_data()
         $columns = str_getcsv($row);
 
         // Vérifier que nous avons suffisamment de colonnes
-        if (count($columns) >= 13) {
+        if (count($columns) >= 16) {
             $letterIndex = 5;  // Colonne F (index 5)
             $num1Index = 6;    // Colonne G (index 6)
             $num2Index = 7;    // Colonne H (index 7)
             $num3Index = 8;    // Colonne I (index 8)
             $priceIndex = 10;  // Colonne K (index 10)
             $descIndex = 12;   // Colonne M (index 12)
+            $collIndex = 13;   // Colonne N (index 13)
+            $finiIndex = 14;   // Colonne O (index 14)
+            $dimIndex = 15;   // Colonne P (index 15)
 
             $excelData[] = [
                 'letter' => isset($columns[$letterIndex]) ? trim($columns[$letterIndex]) : '',
@@ -630,7 +1202,10 @@ function get_excel_data()
                 'num2' => isset($columns[$num2Index]) ? trim($columns[$num2Index]) : '',
                 'num3' => isset($columns[$num3Index]) ? trim($columns[$num3Index]) : '',
                 'price' => isset($columns[$priceIndex]) ? trim($columns[$priceIndex]) : '',
-                'designation' => isset($columns[$descIndex]) ? trim($columns[$descIndex]) : ''
+                'designation' => isset($columns[$descIndex]) ? trim($columns[$descIndex]) : '',
+                'collection' => isset($columns[$collIndex]) ? trim($columns[$collIndex]) : '',
+                'finition' => isset($columns[$finiIndex]) ? trim($columns[$finiIndex]) : '',
+                'dimension' => isset($columns[$dimIndex]) ? trim($columns[$dimIndex]) : ''
             ];
         }
     }
@@ -677,4 +1252,351 @@ function convert_url_to_path($url)
     }
 
     return false;
+}
+
+/**
+ * Traite les actions POST/GET de la page d'administration des devis.
+ * Appelé par admin_init avant tout affichage. Effectue les modifications
+ * puis redirige pour éviter la re-soumission du formulaire (PRG pattern).
+ *
+ * @return void
+ */
+function wishlist_devis_handle_admin_post()
+{
+    if (!current_user_can('manage_options')) {
+        return;
+    }
+
+    // On n'agit que si on est sur la bonne page admin.
+    $page = isset($_REQUEST['page']) ? sanitize_key($_REQUEST['page']) : '';
+    if ($page !== 'wishlist-devis-requests') {
+        return;
+    }
+
+    global $wpdb;
+    $requests_table = $wpdb->prefix . 'wishlist_devis_requests';
+
+    $admin_action = isset($_REQUEST['wd_action']) ? sanitize_key($_REQUEST['wd_action']) : '';
+
+    // --- Suppression ---
+    if ($admin_action === 'delete') {
+        $id = isset($_GET['id']) ? (int) $_GET['id'] : 0;
+        if ($id > 0 && isset($_GET['_wpnonce']) && wp_verify_nonce(sanitize_text_field(wp_unslash($_GET['_wpnonce'])), 'wd_delete_' . $id)) {
+            $wpdb->delete($requests_table, array('id' => $id), array('%d'));
+        }
+        wp_redirect(admin_url('admin.php?page=wishlist-devis-requests'));
+        exit;
+    }
+
+    // --- Mise à jour (édition complète ou changement de statut seul) ---
+    if ($admin_action === 'update' && $_SERVER['REQUEST_METHOD'] === 'POST') {
+        $id = isset($_POST['id']) ? (int) $_POST['id'] : 0;
+        if ($id > 0 && isset($_POST['_wpnonce']) && wp_verify_nonce(sanitize_text_field(wp_unslash($_POST['_wpnonce'])), 'wd_update_' . $id)) {
+
+            $allowed_statuses = array_keys(wishlist_devis_get_statuses());
+
+            $update_data    = array();
+            $update_formats = array();
+
+            if (isset($_POST['status'])) {
+                $new_status = sanitize_key($_POST['status']);
+                if (in_array($new_status, $allowed_statuses, true)) {
+                    $update_data['status']   = $new_status;
+                    $update_formats[]        = '%s';
+                }
+            }
+
+            // Champs éditables complets (via formulaire d'édition)
+            if (isset($_POST['full_edit'])) {
+                $text_fields = array('full_name', 'email', 'phone', 'address', 'postal_code', 'city', 'country', 'company_name', 'siret');
+                foreach ($text_fields as $field) {
+                    if (isset($_POST[$field])) {
+                        $update_data[$field]   = sanitize_text_field(wp_unslash($_POST[$field]));
+                        $update_formats[]      = '%s';
+                    }
+                }
+                if (isset($_POST['customer_type'])) {
+                    $ct = sanitize_key($_POST['customer_type']);
+                    if (in_array($ct, array(WD_CUSTOMER_TYPE_INDIVIDUAL, WD_CUSTOMER_TYPE_PROFESSIONAL), true)) {
+                        $update_data['customer_type'] = $ct;
+                        $update_formats[]             = '%s';
+                    }
+                }
+            }
+
+            if (!empty($update_data)) {
+                $wpdb->update($requests_table, $update_data, array('id' => $id), $update_formats, array('%d'));
+            }
+        }
+
+        $redirect_url = admin_url('admin.php?page=wishlist-devis-requests&action=view&id=' . $id);
+        wp_redirect($redirect_url);
+        exit;
+    }
+}
+
+/**
+ * Affiche la page d'administration listant toutes les demandes de devis.
+ *
+ * Liste toutes les lignes de {prefix}wishlist_devis_requests, de la plus
+ * récente à la plus ancienne (created_at DESC, id DESC). Chaque valeur
+ * dynamique est échappée avec esc_html() / esc_attr().
+ *
+ * @return void
+ */
+function wishlist_devis_render_admin_page()
+{
+    global $wpdb;
+
+    $requests_table = $wpdb->prefix . 'wishlist_devis_requests';
+
+    $admin_view = isset($_GET['action']) ? sanitize_key($_GET['action']) : 'list';
+    $edit_id    = isset($_GET['id']) ? (int) $_GET['id'] : 0;
+
+    // -----------------------------------------------------------------------
+    // Vue DÉTAIL / ÉDITION
+    // -----------------------------------------------------------------------
+    if (($admin_view === 'view' || $admin_view === 'edit') && $edit_id > 0) {
+        $row = $wpdb->get_row(
+            $wpdb->prepare("SELECT * FROM {$requests_table} WHERE id = %d", $edit_id),
+            ARRAY_A
+        );
+
+        if (!$row) {
+            echo '<div class="wrap"><div class="notice notice-error"><p>' . esc_html('Demande introuvable.') . '</p></div></div>';
+            return;
+        }
+
+        $statuses         = wishlist_devis_get_statuses();
+        $current_status   = isset($row['status']) ? $row['status'] : 'a_envoyer';
+        $is_professional  = (isset($row['customer_type']) && $row['customer_type'] === WD_CUSTOMER_TYPE_PROFESSIONAL);
+        $is_edit          = ($admin_view === 'edit');
+        $list_url         = admin_url('admin.php?page=wishlist-devis-requests');
+        $edit_url         = admin_url('admin.php?page=wishlist-devis-requests&action=edit&id=' . $edit_id);
+        $delete_url       = wp_nonce_url(
+            admin_url('admin.php?page=wishlist-devis-requests&wd_action=delete&id=' . $edit_id),
+            'wd_delete_' . $edit_id
+        );
+
+        $products = array();
+        if (!empty($row['products'])) {
+            $decoded = json_decode($row['products'], true);
+            if (is_array($decoded)) {
+                $products = $decoded;
+            }
+        }
+
+        echo '<div class="wrap wd-admin-wrap">';
+        echo '<h1 class="wp-heading-inline">' . esc_html('Demande de devis — Réf. ' . $row['reference']) . '</h1>';
+        echo '<a href="' . esc_url($list_url) . '" class="page-title-action">&larr; Retour à la liste</a>';
+        echo '<hr class="wp-header-end">';
+
+        // -- Notices de succès/erreur transmises via query string
+        if (isset($_GET['updated']) && $_GET['updated'] === '1') {
+            echo '<div class="notice notice-success is-dismissible"><p>Demande mise à jour.</p></div>';
+        }
+
+        // -- Formulaire principal (statut + champs si mode édition)
+        echo '<form method="post" action="' . esc_url(admin_url('admin.php?page=wishlist-devis-requests')) . '">';
+        echo '<input type="hidden" name="wd_action" value="update">';
+        echo '<input type="hidden" name="id" value="' . esc_attr($edit_id) . '">';
+        wp_nonce_field('wd_update_' . $edit_id);
+        if ($is_edit) {
+            echo '<input type="hidden" name="full_edit" value="1">';
+        }
+
+        echo '<div class="wd-detail-grid">';
+
+        // Colonne gauche : informations client
+        echo '<div class="wd-detail-card">';
+        echo '<h2>Informations client</h2>';
+
+        if ($is_edit) {
+            // -- Mode édition : champs modifiables
+            $field = function($label, $name, $value, $type = 'text') use ($row) {
+                echo '<div class="wd-field-row">';
+                echo '<label for="wd-' . esc_attr($name) . '">' . esc_html($label) . '</label>';
+                echo '<input type="' . esc_attr($type) . '" id="wd-' . esc_attr($name) . '" name="' . esc_attr($name) . '" value="' . esc_attr($value) . '">';
+                echo '</div>';
+            };
+
+            echo '<div class="wd-field-row">';
+            echo '<label>Type de client</label>';
+            echo '<select name="customer_type">';
+            foreach (array(WD_CUSTOMER_TYPE_INDIVIDUAL => 'Particulier', WD_CUSTOMER_TYPE_PROFESSIONAL => 'Professionnel') as $val => $lbl) {
+                $sel = (isset($row['customer_type']) && $row['customer_type'] === $val) ? ' selected' : '';
+                echo '<option value="' . esc_attr($val) . '"' . $sel . '>' . esc_html($lbl) . '</option>';
+            }
+            echo '</select>';
+            echo '</div>';
+
+            $field('Nom complet', 'full_name', $row['full_name'] ?? '');
+            $field('Email', 'email', $row['email'] ?? '', 'email');
+            $field('Téléphone', 'phone', $row['phone'] ?? '');
+            $field('Société', 'company_name', $row['company_name'] ?? '');
+            $field('SIRET', 'siret', $row['siret'] ?? '');
+            $field('Adresse', 'address', $row['address'] ?? '');
+            $field('Code postal', 'postal_code', $row['postal_code'] ?? '');
+            $field('Ville', 'city', $row['city'] ?? '');
+            $field('Pays', 'country', $row['country'] ?? '');
+        } else {
+            // -- Mode lecture
+            $info_rows = array(
+                'Référence'      => $row['reference'] ?? '',
+                'Date'           => isset($row['created_at']) ? date_i18n('d/m/Y à H:i', strtotime($row['created_at'])) : '',
+                'Type de client' => $is_professional ? 'Professionnel' : 'Particulier',
+            );
+            if ($is_professional) {
+                $info_rows['Société'] = $row['company_name'] ?? '';
+                $info_rows['SIRET']   = $row['siret'] ?? '';
+            }
+            $info_rows['Nom']         = $row['full_name'] ?? '';
+            $info_rows['Email']       = $row['email'] ?? '';
+            $info_rows['Téléphone']   = $row['phone'] ?? '';
+            $info_rows['Adresse']     = $row['address'] ?? '';
+            $info_rows['Code postal'] = $row['postal_code'] ?? '';
+            $info_rows['Ville']       = $row['city'] ?? '';
+            $info_rows['Pays']        = $row['country'] ?? '';
+
+            foreach ($info_rows as $label => $value) {
+                if ($value === '') continue;
+                echo '<div class="wd-info-row">';
+                echo '<span class="wd-info-label">' . esc_html($label) . '</span>';
+                echo '<span class="wd-info-value">' . esc_html($value) . '</span>';
+                echo '</div>';
+            }
+        }
+        echo '</div>'; // .wd-detail-card
+
+        // Colonne droite : statut + produits
+        echo '<div>';
+
+        // Bloc statut
+        echo '<div class="wd-detail-card">';
+        echo '<h2>Statut</h2>';
+        echo '<select name="status" class="wd-status-select">';
+        foreach ($statuses as $slug => $label) {
+            $sel = ($current_status === $slug) ? ' selected' : '';
+            echo '<option value="' . esc_attr($slug) . '"' . $sel . '>' . esc_html($label) . '</option>';
+        }
+        echo '</select>';
+        echo '</div>'; // .wd-detail-card statut
+
+        // Bloc produits
+        echo '<div class="wd-detail-card">';
+        echo '<h2>Produits (' . count($products) . ')</h2>';
+        if (!empty($products)) {
+            echo '<table class="widefat wd-products-table">';
+            echo '<thead><tr><th>Produit</th><th>Qté</th></tr></thead><tbody>';
+            foreach ($products as $p) {
+                $name = isset($p['name']) ? $p['name'] : '';
+                $qty  = isset($p['quantity']) ? (int) $p['quantity'] : 1;
+                echo '<tr><td>' . esc_html($name) . '</td><td>' . esc_html($qty) . '</td></tr>';
+            }
+            echo '</tbody></table>';
+        } else {
+            echo '<p>Aucun produit.</p>';
+        }
+        echo '</div>'; // .wd-detail-card produits
+
+        echo '</div>'; // colonne droite
+        echo '</div>'; // .wd-detail-grid
+
+        // Boutons d'action
+        echo '<div class="wd-action-bar">';
+        if ($is_edit) {
+            echo '<button type="submit" class="button button-primary">Enregistrer les modifications</button> ';
+            echo '<a href="' . esc_url(admin_url('admin.php?page=wishlist-devis-requests&action=view&id=' . $edit_id)) . '" class="button">Annuler</a>';
+        } else {
+            echo '<button type="submit" class="button button-primary">Mettre à jour le statut</button> ';
+            echo '<a href="' . esc_url($edit_url) . '" class="button">Modifier les informations</a> ';
+            echo '<a href="' . esc_url($delete_url) . '" class="button button-link-delete wd-delete-link" onclick="return confirm(\'Supprimer définitivement cette demande ?\')">Supprimer</a>';
+        }
+        echo '</div>';
+
+        echo '</form>';
+        echo '</div>'; // .wrap
+        return;
+    }
+
+    // -----------------------------------------------------------------------
+    // Vue LISTE
+    // -----------------------------------------------------------------------
+    $rows = $wpdb->get_results(
+        "SELECT * FROM {$requests_table} ORDER BY created_at DESC, id DESC",
+        ARRAY_A
+    );
+
+    echo '<div class="wrap wd-admin-wrap">';
+    echo '<h1>' . esc_html('Demandes de devis') . '</h1>';
+
+    if (empty($rows)) {
+        echo '<p>' . esc_html('Aucune demande.') . '</p>';
+        echo '</div>';
+        return;
+    }
+
+    $statuses = wishlist_devis_get_statuses();
+
+    echo '<table class="widefat striped wd-list-table">';
+    echo '<thead><tr>';
+    echo '<th>' . esc_html('Réf.') . '</th>';
+    echo '<th>' . esc_html('Date') . '</th>';
+    echo '<th>' . esc_html('Client') . '</th>';
+    echo '<th>' . esc_html('Email') . '</th>';
+    echo '<th>' . esc_html('Produits') . '</th>';
+    echo '<th>' . esc_html('Statut') . '</th>';
+    echo '<th>' . esc_html('Actions') . '</th>';
+    echo '</tr></thead>';
+    echo '<tbody>';
+
+    foreach ($rows as $row) {
+        $id            = (int) ($row['id'] ?? 0);
+        $reference     = $row['reference'] ?? '';
+        $created_at    = isset($row['created_at']) ? date_i18n('d/m/Y', strtotime($row['created_at'])) : '';
+        $customer_type = $row['customer_type'] ?? '';
+        $full_name     = $row['full_name'] ?? '';
+        $company_name  = $row['company_name'] ?? '';
+        $email         = $row['email'] ?? '';
+        $current_status = $row['status'] ?? 'a_envoyer';
+        $status_label  = wishlist_devis_status_label($current_status);
+
+        $name_summary = $full_name;
+        if ($company_name !== '') {
+            $name_summary = $full_name !== '' ? $full_name . ' (' . $company_name . ')' : $company_name;
+        }
+
+        $products      = array();
+        $products_raw  = $row['products'] ?? '';
+        if ($products_raw !== '') {
+            $decoded = json_decode($products_raw, true);
+            if (is_array($decoded)) $products = $decoded;
+        }
+        $product_count = count($products);
+
+        $view_url   = admin_url('admin.php?page=wishlist-devis-requests&action=view&id=' . $id);
+        $delete_url = wp_nonce_url(
+            admin_url('admin.php?page=wishlist-devis-requests&wd_action=delete&id=' . $id),
+            'wd_delete_' . $id
+        );
+
+        $status_css = 'wd-status wd-status--' . esc_attr($current_status);
+
+        echo '<tr>';
+        echo '<td><strong>' . esc_html($reference) . '</strong></td>';
+        echo '<td>' . esc_html($created_at) . '</td>';
+        echo '<td>' . esc_html($name_summary) . '</td>';
+        echo '<td>' . esc_html($email) . '</td>';
+        echo '<td>' . esc_html($product_count . ' produit(s)') . '</td>';
+        echo '<td><span class="' . $status_css . '">' . esc_html($status_label) . '</span></td>';
+        echo '<td class="wd-row-actions">';
+        echo '<a href="' . esc_url($view_url) . '" class="button button-small">Voir</a> ';
+        echo '<a href="' . esc_url($delete_url) . '" class="button button-small button-link-delete" onclick="return confirm(\'Supprimer cette demande ?\')">Supprimer</a>';
+        echo '</td>';
+        echo '</tr>';
+    }
+
+    echo '</tbody>';
+    echo '</table>';
+    echo '</div>';
 }

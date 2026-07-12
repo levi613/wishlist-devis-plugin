@@ -260,23 +260,18 @@ function wishlist_devis_validate_submission($payload)
     // --- customer_type ---
     $customer_type_raw = isset($payload['customer_type']) ? $payload['customer_type'] : '';
     $allowed_types     = array(WD_CUSTOMER_TYPE_INDIVIDUAL, WD_CUSTOMER_TYPE_PROFESSIONAL);
-    $is_known_type     = is_string($customer_type_raw) && in_array($customer_type_raw, $allowed_types, true);
-    if (!$is_known_type) {
-        $errors['customer_type'] = 'Le type de client est invalide.';
+    if (!is_string($customer_type_raw) || !in_array($customer_type_raw, $allowed_types, true)) {
+        $customer_type_raw = WD_CUSTOMER_TYPE_INDIVIDUAL;
     }
 
     // --- full_name ---
     $full_name_raw = isset($payload['full_name']) ? $payload['full_name'] : '';
-    $full_name_trimmed = is_string($full_name_raw) ? trim($full_name_raw) : '';
-    if ($full_name_trimmed === '') {
-        $errors['full_name'] = 'Le nom complet est obligatoire.';
-    }
 
     // --- email ---
     $email_raw = isset($payload['email']) ? $payload['email'] : '';
     $email_trimmed = is_string($email_raw) ? trim($email_raw) : '';
-    if ($email_trimmed === '' || !is_email($email_trimmed)) {
-        $errors['email'] = 'Une adresse email valide est obligatoire.';
+    if ($email_trimmed !== '' && !is_email($email_trimmed)) {
+        $errors['email'] = 'Le format de l\'adresse email est invalide.';
     }
 
     // --- produits ---
@@ -308,16 +303,8 @@ function wishlist_devis_validate_submission($payload)
     // --- champs société (professionnel uniquement) ---
     $company_name_raw = isset($payload['company_name']) ? $payload['company_name'] : '';
     $siret_raw        = isset($payload['siret']) ? $payload['siret'] : '';
-    $company_name_trimmed = is_string($company_name_raw) ? trim($company_name_raw) : '';
-    $siret_trimmed        = is_string($siret_raw) ? trim($siret_raw) : '';
-
-    if ($is_known_type && $customer_type_raw === WD_CUSTOMER_TYPE_PROFESSIONAL) {
-        if ($company_name_trimmed === '') {
-            $errors['company_name'] = 'Le nom de société est obligatoire pour un professionnel.';
-        }
-        if ($siret_trimmed === '') {
-            $errors['siret'] = 'Le numéro de SIRET est obligatoire pour un professionnel.';
-        }
+    if (is_string($customer_type_raw) && $customer_type_raw === WD_CUSTOMER_TYPE_PROFESSIONAL) {
+        // Aucun champ n'est obligatoire, même pour un professionnel.
     }
 
     // En cas d'erreur : pas d'assainissement, data === null.
@@ -488,7 +475,13 @@ function wishlist_devis_send_email()
     $data = $result['data'];
 
     // Allocation de la référence (réutilisée si l'email est déjà connu).
-    $reference = wishlist_devis_get_or_create_reference($data['email']);
+    // Si email vide, on alloue une clé technique unique pour ne pas bloquer la demande.
+    $reference_email_key = $data['email'];
+    if ($reference_email_key === '') {
+        $reference_email_key = 'anon+' . current_time('timestamp', true) . '+' . wp_generate_password(8, false, false) . '@noemail.local';
+    }
+
+    $reference = wishlist_devis_get_or_create_reference($reference_email_key);
     if ($reference === '') {
         wp_send_json(array('message' => 'Numéro de référence indisponible.'), 500);
         return;
@@ -509,14 +502,28 @@ function wishlist_devis_send_email()
         return;
     }
 
-    // $admin_email = get_option('wishlist_devis_admin_email');
-    // if (empty($admin_email)) {
-    //     $admin_email = get_option('admin_email');
-    // }
+    $configured_admins = get_option('wishlist_devis_admin_email');
+    $admin_recipients  = array();
 
-    $admin_email = 'jbastierdevillatte@gmail.com';
-    // $admin_email = 'levibelhamou@gmail.com';
-    $admin_email2 = 'levibelhamou@gmail.com';
+    if (is_string($configured_admins) && trim($configured_admins) !== '') {
+        $raw_admins = preg_split('/[\s,;]+/', $configured_admins);
+        foreach ($raw_admins as $candidate) {
+            $candidate = trim((string) $candidate);
+            if ($candidate !== '' && is_email($candidate)) {
+                $admin_recipients[] = strtolower($candidate);
+            }
+        }
+    }
+
+    // Fallback explicite : les 2 admins attendus reçoivent aussi les demandes.
+    $admin_recipients[] = 'jbastierdevillatte@gmail.com';
+    $admin_recipients[] = 'levibelhamou@gmail.com';
+
+    $admin_recipients = array_values(array_unique($admin_recipients));
+    if (empty($admin_recipients)) {
+        wp_send_json(array('message' => "Aucun email administrateur n'est configuré."), 500);
+        return;
+    }
 
 
     $subject = "Nouvelle demande de devis - " . $data['name'];
@@ -671,6 +678,10 @@ function wishlist_devis_send_email()
     // Génération du devis en Excel (.xlsx)
     $data['created_at'] = current_time('mysql');
     $file_path = wishlist_devis_generate_excel($data['products'], $data, $rowId);
+    if ($file_path === '' || !file_exists($file_path)) {
+        wp_send_json(array('message' => "Demande enregistrée (réf. $reference), mais le fichier Excel n'a pas pu être généré."), 500);
+        return;
+    }
 
     // Envoi de l'email avec pièce jointe
     $headers = [
@@ -678,11 +689,14 @@ function wishlist_devis_send_email()
         'From: JB AdeV - Site web <wordpress@jbadev.com>'
     ];
 
+    if (!empty($data['email'])) {
+        $headers[] = 'Reply-To: ' . $data['email'];
+    }
+
     $attachments = [$file_path];
 
-    // Utilisation de wp_mail avec le message HTML
-    $mail_sent = wp_mail($admin_email, $subject, $html_message, $headers, $attachments);
-    $mail_sent2 = wp_mail($admin_email2, $subject, $html_message, $headers, $attachments);
+    // Envoi en un seul mail à tous les admins avec la pièce jointe.
+    $mail_sent = wp_mail($admin_recipients, $subject, $html_message, $headers, $attachments);
 
     if ($mail_sent) {
         wp_send_json(['message' => "Votre demande (réf. $reference) a bien été envoyée."]);

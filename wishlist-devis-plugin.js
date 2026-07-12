@@ -96,42 +96,13 @@ document.addEventListener('DOMContentLoaded', function () {
         successMessage.textContent = '';
         successMessage.classList.remove('active');
 
-        // Valider les champs
-        let isValid = true;
-        let validationErrors = [];
-
-        // Validation du nom complet
-        if (!fullNameInput || !fullNameInput.value.trim()) {
-            validationErrors.push('Veuillez entrer votre prénom et nom.');
-            isValid = false;
-        }
-
-        // Validation de l'email
-        if (!emailInput || !emailInput.value.trim()) {
-            validationErrors.push('Veuillez entrer votre email.');
-            isValid = false;
-        } else if (!isValidEmail(emailInput.value.trim())) {
-            validationErrors.push('Veuillez entrer un email valide.');
-            isValid = false;
-        }
-
-        // Validation des champs société pour les professionnels
-        const customerType = getSelectedCustomerType();
-        if (customerType === 'professionnel') {
-            if (!companyNameInput || !companyNameInput.value.trim()) {
-                validationErrors.push('Veuillez entrer le nom de la société.');
-                isValid = false;
-            }
-            if (!siretInput || !siretInput.value.trim()) {
-                validationErrors.push('Veuillez entrer le numéro de SIRET.');
-                isValid = false;
-            }
-        }
-
-        if (!isValid) {
-            errorMessage.textContent = validationErrors.join(' ');
+        // Aucun champ n'est obligatoire : si un email est saisi, on valide seulement son format.
+        if (emailInput && emailInput.value.trim() && !isValidEmail(emailInput.value.trim())) {
+            errorMessage.textContent = 'Le format de l\'email est invalide.';
             return;
         }
+
+        const customerType = getSelectedCustomerType();
 
         // Récupérer les produits (boucle de collecte existante, conservée)
         let products = [];

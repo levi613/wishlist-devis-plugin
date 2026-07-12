@@ -123,26 +123,26 @@ function wishlist_devis_shortcode()
             <div id="devis-company-fields">
                 <div class="wd-row">
                     <div class="form-group">
-                        <label for="devis-company-name">Nom de société <span class="wd-required">*</span></label>
+                        <label for="devis-company-name">Nom de société</label>
                         <input type="text" id="devis-company-name" placeholder="Ex. JB AdeV">
                     </div>
 
                     <div class="form-group">
-                        <label for="devis-siret">Numéro de SIRET <span class="wd-required">*</span></label>
+                        <label for="devis-siret">Numéro de SIRET</label>
                         <input type="text" id="devis-siret" placeholder="Ex. 342 131 943 00082" inputmode="numeric">
                     </div>
                 </div>
             </div>
 
             <div class="form-group">
-                <label for="devis-full-name">Prénom et nom <span class="wd-required">*</span></label>
-                <input type="text" id="devis-full-name" placeholder="Votre prénom et nom" required>
+                <label for="devis-full-name">Prénom et nom</label>
+                <input type="text" id="devis-full-name" placeholder="Votre prénom et nom">
             </div>
 
             <div class="wd-row">
                 <div class="form-group">
-                    <label for="devis-email">Email <span class="wd-required">*</span></label>
-                    <input type="email" id="devis-email" placeholder="vous@exemple.com" required>
+                    <label for="devis-email">Email</label>
+                    <input type="email" id="devis-email" placeholder="vous@exemple.com">
                 </div>
 
                 <div class="form-group">

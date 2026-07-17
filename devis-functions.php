@@ -1180,8 +1180,12 @@ function wishlist_devis_generate_word($products, $data)
  *   E3-E9 : Infos client (nom, adresse, CP+ville, pays, téléphone, email, SIRET)
  *   C10 : Numéro de devis (ex : 2026 05 0001) — compteur mensuel remis à zéro
  *   C11 : Date en français long (ex : 26 mai 2026)
- *   À partir de la ligne 14 : produits (A=JB AdeV, B=ref, C=désig, D=coll,
- *                              E=finition, F=dim, G=qté, H=prix unit, I=total, J=image)
+ *   À partir de la ligne 14 : produits
+ *     - A : Image du produit
+ *     - B-F (fusionnées) : 3 lignes : "Référence (Collection)", "Désignation", "Finition et dimension"
+ *     - G : Quantité
+ *     - H : Prix unitaire
+ *     - I : Total
  *   2 lignes sous le dernier produit, colonne I : formule =SUM(I14:I{last})
  *
  * @param array  $products  Tableau de produits (issu de la BDD ou du formulaire).
@@ -1432,7 +1436,9 @@ function wishlist_devis_generate_excel($products, $data, $devis_id = 0)
         $sheet->insertNewRowBefore(15, $num_products - 1);
         for ($i = 0; $i < $num_products - 1; $i++) {
             $new_row = 15 + $i;
-            $sheet->duplicateStyle($sheet->getStyle('A14:J14'), 'A' . $new_row . ':J' . $new_row);
+            $sheet->duplicateStyle($sheet->getStyle('A14:I14'), 'A' . $new_row . ':I' . $new_row);
+            // Fusionner les cellules B-F pour chaque nouvelle ligne
+            $sheet->mergeCells('B' . $new_row . ':F' . $new_row);
             $row_height = $sheet->getRowDimension(14)->getRowHeight();
             if ($row_height > 0) {
                 $sheet->getRowDimension($new_row)->setRowHeight($row_height);
@@ -1440,44 +1446,84 @@ function wishlist_devis_generate_excel($products, $data, $devis_id = 0)
         }
     }
 
+    // Élargir la colonne H pour éviter les #####
+    $sheet->getColumnDimension('H')->setWidth(15);
+    $sheet->getColumnDimension('I')->setWidth(15);
+
     // ---- Remplir les lignes produits ----
     foreach ($product_rows as $idx => $prod) {
         $row_num = 14 + $idx;
 
-        $sheet->setCellValue('A' . $row_num, 'JB AdeV');
-        $sheet->setCellValue('B' . $row_num, $prod['ref']);
-        $sheet->setCellValue('C' . $row_num, $prod['designation']);
-        $sheet->setCellValue('D' . $row_num, $prod['collection']);
-        $sheet->setCellValue('E' . $row_num, $prod['finition']);
-        $sheet->setCellValue('F' . $row_num, $prod['dimension']);
-        $sheet->setCellValue('G' . $row_num, $prod['quantity']);
-
-        if ($prod['unit_price'] > 0) {
-            $sheet->setCellValue('H' . $row_num, $prod['unit_price']);
-            $sheet->getStyle('H' . $row_num)->getNumberFormat()->setFormatCode($currency_format);
-            $sheet->setCellValue('I' . $row_num, $prod['unit_price'] * $prod['quantity']);
-            $sheet->getStyle('I' . $row_num)->getNumberFormat()->setFormatCode($currency_format);
+        // Fusionner B-F pour la ligne 14 aussi (au cas où le modèle ne le ferait pas)
+        if ($row_num == 14) {
+            $sheet->mergeCells('B14:F14');
         }
 
-        // Image du produit en colonne J
+        // Colonne A : Image du produit (95% de la largeur, hauteur proportionnelle)
         if (!empty($prod['image_url']) && $prod['image_url'] !== 'N/A') {
             $img_path = convert_url_to_path($prod['image_url']);
             if ($img_path && file_exists($img_path)) {
                 try {
+                    // Récupérer la largeur de la cellule A
+                    $col_width_chars = $sheet->getColumnDimension('A')->getWidth();
+                    if ($col_width_chars <= 0) {
+                        $col_width_chars = 10; // Largeur par défaut
+                    }
+
+                    // Conversion approximative : 1 char ≈ 7 pixels
+                    $cell_width_px = $col_width_chars * 7;
+
+                    // 95% de la largeur de la cellule
+                    $img_width = $cell_width_px * 0.95;
+
+                    // Offset horizontal pour centrer l'image
+                    $offset_x = ($cell_width_px - $img_width) / 2;
+
                     $drawing = new \PhpOffice\PhpSpreadsheet\Worksheet\Drawing();
                     $drawing->setName('Produit');
                     $drawing->setDescription($prod['ref']);
                     $drawing->setPath($img_path);
-                    $drawing->setHeight(60);
-                    $drawing->setOffsetX(2);
-                    $drawing->setOffsetY(2);
-                    $drawing->setCoordinates('J' . $row_num);
+                    $drawing->setWidth((int)$img_width);  // Largeur fixe, hauteur proportionnelle
+                    $drawing->setOffsetX((int)$offset_x); // Centrer horizontalement
+                    $drawing->setOffsetY(2);              // Petit offset vertical
+                    $drawing->setCoordinates('A' . $row_num);
                     $drawing->setWorksheet($sheet);
-                    $sheet->getRowDimension($row_num)->setRowHeight(55);
                 } catch (Exception $e) {
                     // Image indisponible — on continue sans elle
                 }
             }
+        }
+
+        // Colonnes B-F (fusionnées) : texte multi-lignes
+        $collection_text = !empty($prod['collection']) ? ' (Collection ' . $prod['collection'] . ')' : '';
+        $finition_dim    = trim($prod['finition'] . ' ' . $prod['dimension']);
+
+        $multi_line_text = $prod['ref'] . $collection_text . "\n"
+            . $prod['designation'] . "\n"
+            . $finition_dim;
+
+        $sheet->setCellValue('B' . $row_num, $multi_line_text);
+        $sheet->getStyle('B' . $row_num)->getAlignment()->setWrapText(true);
+
+        // Centrer la colonne A (image)
+        $sheet->getStyle('A' . $row_num)->getAlignment()->setHorizontal(\PhpOffice\PhpSpreadsheet\Style\Alignment::HORIZONTAL_CENTER);
+        $sheet->getStyle('A' . $row_num)->getAlignment()->setVertical(\PhpOffice\PhpSpreadsheet\Style\Alignment::VERTICAL_CENTER);
+
+        // Colonnes G, H, I : Quantité, Prix unitaire, Total
+        $sheet->setCellValue('G' . $row_num, $prod['quantity']);
+
+        // Centrer la colonne G (quantité)
+        $sheet->getStyle('G' . $row_num)->getAlignment()->setHorizontal(\PhpOffice\PhpSpreadsheet\Style\Alignment::HORIZONTAL_CENTER);
+        $sheet->getStyle('G' . $row_num)->getAlignment()->setVertical(\PhpOffice\PhpSpreadsheet\Style\Alignment::VERTICAL_CENTER);
+
+        if ($prod['unit_price'] > 0) {
+            $sheet->setCellValue('H' . $row_num, $prod['unit_price']);
+            $sheet->getStyle('H' . $row_num)->getNumberFormat()->setFormatCode($currency_format);
+            $sheet->getStyle('H' . $row_num)->getAlignment()->setVertical(\PhpOffice\PhpSpreadsheet\Style\Alignment::VERTICAL_CENTER);
+
+            $sheet->setCellValue('I' . $row_num, $prod['unit_price'] * $prod['quantity']);
+            $sheet->getStyle('I' . $row_num)->getNumberFormat()->setFormatCode($currency_format);
+            $sheet->getStyle('I' . $row_num)->getAlignment()->setVertical(\PhpOffice\PhpSpreadsheet\Style\Alignment::VERTICAL_CENTER);
         }
     }
 
@@ -1487,6 +1533,8 @@ function wishlist_devis_generate_excel($products, $data, $devis_id = 0)
 
     $sheet->setCellValue('I' . $total_ht_row, '=SUM(I14:I' . $last_product_row . ')');
     $sheet->getStyle('I' . $total_ht_row)->getNumberFormat()->setFormatCode($currency_format);
+
+    $sheet->getStyle('I' . $total_ht_row)->getAlignment()->setVertical(\PhpOffice\PhpSpreadsheet\Style\Alignment::VERTICAL_CENTER);
 
     // ---- Sauvegarder le fichier ----
     $upload_dir = wp_upload_dir();
@@ -1504,58 +1552,165 @@ function wishlist_devis_generate_excel($products, $data, $devis_id = 0)
     return $file_path;
 }
 
-// Fonction pour récupérer les données du fichier Excel
-function get_excel_data()
+/**
+ * Récupère et parse les données d'un Google Sheet.
+ *
+ * @param string $sheet_url URL du Google Sheet.
+ * @param array  $column_mapping Mapping des colonnes (optionnel).
+ * @return array Données du catalogue.
+ */
+function fetch_google_sheet_data($sheet_url, $column_mapping = null)
 {
-    // Initialiser un tableau pour stocker les données
-    $excelData = [];
+    $data = [];
 
-    // Récupérer le contenu du fichier Excel en ligne
-    $excel_url = 'https://docs.google.com/spreadsheets/d/1OfjkbSpPK3CcvsMbWGabFrdW0cOnxHE9/edit?usp=sharing&ouid=103467285749476133477&rtpof=true&sd=true';
+    // Mapping par défaut (produits généraux : F, G, H, I...)
+    if ($column_mapping === null) {
+        $column_mapping = [
+            'letter' => 5,  // Colonne F (index 5)
+            'num1'   => 6,  // Colonne G (index 6)
+            'num2'   => 7,  // Colonne H (index 7)
+            'num3'   => 8,  // Colonne I (index 8)
+            'price'  => 10, // Colonne K (index 10)
+            'desc'   => 12, // Colonne M (index 12)
+            'coll'   => 13, // Colonne N (index 13)
+            'fini'   => 14, // Colonne O (index 14)
+            'dim'    => 15, // Colonne P (index 15)
+        ];
+    }
 
-    // Pour Google Sheets, il faut généralement convertir l'URL pour pouvoir télécharger
-    // Format: https://docs.google.com/spreadsheets/d/[ID]/export?format=csv
-    $download_url = preg_replace('/\/edit\?usp=sharing.*$/', '/export?format=csv', $excel_url);
+    // Convertir l'URL Google Sheets en URL de téléchargement CSV
+    // Extraire le gid si présent dans l'URL
+    $gid = '';
+    if (preg_match('/[?&]gid=(\d+)/', $sheet_url, $matches)) {
+        $gid = '&gid=' . $matches[1];
+    } elseif (preg_match('/#gid=(\d+)/', $sheet_url, $matches)) {
+        $gid = '&gid=' . $matches[1];
+    }
+
+    // Construire l'URL de téléchargement CSV
+    $download_url = preg_replace('/\/edit.*$/', '/export?format=csv' . $gid, $sheet_url);
 
     // Télécharger le contenu
     $response = wp_remote_get($download_url);
 
     if (is_wp_error($response)) {
-        // En cas d'erreur, retourner un tableau vide
-        return $excelData;
+        error_log('fetch_google_sheet_data: échec du téléchargement pour ' . $sheet_url . ' (download_url: ' . $download_url . ')');
+        return $data;
     }
 
     $csvContent = wp_remote_retrieve_body($response);
 
+    // Log pour déboguer
+    error_log('fetch_google_sheet_data: téléchargement réussi depuis ' . $download_url . ' (' . strlen($csvContent) . ' octets)');
+
     // Analyser le CSV
     $rows = explode("\n", $csvContent);
-    foreach ($rows as $row) {
+    $row_count = 0;
+    foreach ($rows as $index => $row) {
+        // Ignorer les lignes vides
+        if (empty(trim($row))) {
+            continue;
+        }
+
         $columns = str_getcsv($row);
 
         // Vérifier que nous avons suffisamment de colonnes
-        if (count($columns) >= 16) {
-            $letterIndex = 5;  // Colonne F (index 5)
-            $num1Index = 6;    // Colonne G (index 6)
-            $num2Index = 7;    // Colonne H (index 7)
-            $num3Index = 8;    // Colonne I (index 8)
-            $priceIndex = 10;  // Colonne K (index 10)
-            $descIndex = 12;   // Colonne M (index 12)
-            $collIndex = 13;   // Colonne N (index 13)
-            $finiIndex = 14;   // Colonne O (index 14)
-            $dimIndex = 15;   // Colonne P (index 15)
+        $min_columns = max(array_values($column_mapping)) + 1;
+        if (count($columns) >= $min_columns) {
+            // Récupérer le prix et nettoyer le symbole €
+            $raw_price = isset($columns[$column_mapping['price']]) ? trim($columns[$column_mapping['price']]) : '';
+            $clean_price = preg_replace('/[^\d,.]/', '', $raw_price); // Ne garder que chiffres, virgules et points
 
-            $excelData[] = [
-                'letter' => isset($columns[$letterIndex]) ? trim($columns[$letterIndex]) : '',
-                'num1' => isset($columns[$num1Index]) ? trim($columns[$num1Index]) : '',
-                'num2' => isset($columns[$num2Index]) ? trim($columns[$num2Index]) : '',
-                'num3' => isset($columns[$num3Index]) ? trim($columns[$num3Index]) : '',
-                'price' => isset($columns[$priceIndex]) ? trim($columns[$priceIndex]) : '',
-                'designation' => isset($columns[$descIndex]) ? trim($columns[$descIndex]) : '',
-                'collection' => isset($columns[$collIndex]) ? trim($columns[$collIndex]) : '',
-                'finition' => isset($columns[$finiIndex]) ? trim($columns[$finiIndex]) : '',
-                'dimension' => isset($columns[$dimIndex]) ? trim($columns[$dimIndex]) : ''
+            // Gérer finition et dimension (peuvent être combinées dans dim2)
+            $finition = isset($columns[$column_mapping['fini']]) ? trim($columns[$column_mapping['fini']]) : '';
+            $dimension = isset($columns[$column_mapping['dim']]) ? trim($columns[$column_mapping['dim']]) : '';
+
+            // Si dim2 est défini, combiner finition et dimensions (K, L et M)
+            if (isset($column_mapping['dim2'])) {
+                $dim2 = isset($columns[$column_mapping['dim2']]) ? trim($columns[$column_mapping['dim2']]) : '';
+
+                // Combiner K, L et M pour finition/dimension
+                $parts = array_filter([$finition, $dimension, $dim2], 'strlen');
+                $combined = implode(' ', $parts);
+                $finition = $combined;
+                $dimension = '';
+            }
+
+            $letter = isset($columns[$column_mapping['letter']]) ? trim($columns[$column_mapping['letter']]) : '';
+            $designation = isset($columns[$column_mapping['desc']]) ? trim($columns[$column_mapping['desc']]) : '';
+
+            // Ignorer les lignes d'en-tête ou les lignes vides (sans référence ni désignation)
+            if (empty($letter) && empty($designation)) {
+                continue;
+            }
+
+            $data[] = [
+                'letter'      => $letter,
+                'num1'        => isset($columns[$column_mapping['num1']]) ? trim($columns[$column_mapping['num1']]) : '',
+                'num2'        => isset($columns[$column_mapping['num2']]) ? trim($columns[$column_mapping['num2']]) : '',
+                'num3'        => isset($columns[$column_mapping['num3']]) ? trim($columns[$column_mapping['num3']]) : '',
+                'price'       => $clean_price,
+                'designation' => $designation,
+                'collection'  => isset($columns[$column_mapping['coll']]) ? trim($columns[$column_mapping['coll']]) : '',
+                'finition'    => $finition,
+                'dimension'   => $dimension
             ];
+            $row_count++;
         }
+    }
+
+    error_log('fetch_google_sheet_data: ' . $row_count . ' produits récupérés');
+    return $data;
+}
+
+// Fonction pour récupérer les données du fichier Excel
+function get_excel_data()
+{
+    // Mapping par défaut (produits généraux)
+    $default_mapping = [
+        'letter' => 5,  // Colonne F
+        'num1'   => 6,  // Colonne G
+        'num2'   => 7,  // Colonne H
+        'num3'   => 8,  // Colonne I
+        'price'  => 10, // Colonne K
+        'desc'   => 12, // Colonne M
+        'coll'   => 13, // Colonne N
+        'fini'   => 14, // Colonne O
+        'dim'    => 15, // Colonne P
+    ];
+
+    // Mapping pour les produits M (structure différente)
+    $m_mapping = [
+        'letter' => 4,  // Colonne E
+        'num1'   => 5,  // Colonne F
+        'num2'   => 6,  // Colonne G
+        'num3'   => 7,  // Colonne H
+        'desc'   => 8,  // Colonne I - Désignation
+        'coll'   => 9,  // Colonne J - Collection
+        'fini'   => 10, // Colonne K - Finition/Dimension (à combiner avec L et M)
+        'dim'    => 11, // Colonne L - Finition/Dimension 2
+        'dim2'   => 12, // Colonne M - Finition/Dimension 3
+        'price'  => 13, // Colonne N - Prix
+    ];
+
+    // Configuration des sheets avec leurs mappings respectifs
+    $sheets = [
+        [
+            'url'     => 'https://docs.google.com/spreadsheets/d/1OfjkbSpPK3CcvsMbWGabFrdW0cOnxHE9/edit?usp=sharing&ouid=103467285749476133477&rtpof=true&sd=true',
+            'mapping' => $default_mapping,
+        ],
+        [
+            'url'     => 'https://docs.google.com/spreadsheets/d/1XQqzpYgFaACAuekK5XZlix5kAJMsYWu80glyGfftV7I/edit?gid=0#gid=0',
+            'mapping' => $m_mapping,
+        ],
+    ];
+
+    $excelData = [];
+
+    // Récupérer et combiner les données des deux sources
+    foreach ($sheets as $sheet) {
+        $data = fetch_google_sheet_data($sheet['url'], $sheet['mapping']);
+        $excelData = array_merge($excelData, $data);
     }
 
     return $excelData;
